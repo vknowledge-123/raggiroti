@@ -97,6 +97,9 @@ def _extract_candidate_text(data: dict) -> str:
         for p in parts:
             if isinstance(p, dict) and isinstance(p.get("text"), str):
                 texts.append(p["text"])
+            inline = p.get("inlineData") if isinstance(p, dict) else None
+            if isinstance(inline, dict) and isinstance(inline.get("data"), str):
+                texts.append(inline["data"])
         return "\n".join(texts).strip()
     except Exception:
         return ""
@@ -110,8 +113,10 @@ def _normalize_model_id(model: str) -> str:
 
 
 def _sanitize_error(s: str) -> str:
-    s = s or ""
-    return s.replace("\n", " ").strip()
+    s = (s or "").replace("\n", " ").strip()
+    # Avoid leaking Gemini API keys (httpx may include full URL with ?key=...).
+    s = re.sub(r"(key=)[^&\s]+", r"\1***", s)
+    return s
 
 def _truncate(s: str, n: int = 240) -> str:
     s = (s or "").strip()
@@ -368,13 +373,28 @@ class NextDayPredictor:
                 "gap_points_min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 "gap_points_max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 "bias": {"type": "string", "enum": ["BUY", "SELL", "WAIT"]},
-                "entry_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
-                "operator_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
-                "no_trade_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
+                "entry_zone": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                        {"type": "null"},
+                    ]
+                },
+                "operator_zone": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                        {"type": "null"},
+                    ]
+                },
+                "no_trade_zone": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                        {"type": "null"},
+                    ]
+                },
                 "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                "targets": {"type": "array", "items": {"type": "number"}},
-                "liquidity_pools": {"type": "array", "items": {"type": "number"}},
-                "reason_points": {"type": "array", "items": {"type": "string"}},
+                "targets": {"type": "array", "items": {"type": "number"}, "maxItems": 5},
+                "liquidity_pools": {"type": "array", "items": {"type": "number"}, "maxItems": 8},
+                "reason_points": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
             },
             "required": ["bucket_key", "gap_points_min", "gap_points_max", "bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
         }
@@ -383,7 +403,7 @@ class NextDayPredictor:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "summary_points": {"type": "array", "items": {"type": "string"}},
+                "summary_points": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
                 "base_levels": {
                     "type": "object",
                     "additionalProperties": False,
@@ -391,13 +411,13 @@ class NextDayPredictor:
                         "prev_close": {"type": "number"},
                         "PDH": {"type": "number"},
                         "PDL": {"type": "number"},
-                        "operator_sell_zone": {"type": "array", "items": {"type": "number"}},
-                        "operator_buy_zone": {"type": "array", "items": {"type": "number"}},
-                        "no_trade_zone": {"type": "array", "items": {"type": "number"}},
+                        "operator_sell_zone": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                        "operator_buy_zone": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                        "no_trade_zone": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
                     },
                     "required": ["prev_close", "PDH", "PDL", "operator_sell_zone", "operator_buy_zone", "no_trade_zone"],
                 },
-                "gap_plans": {"type": "array", "items": bucket_schema},
+                "gap_plans": {"type": "array", "items": bucket_schema, "minItems": 10, "maxItems": 10},
             },
             "required": ["summary_points", "base_levels", "gap_plans"],
         }
@@ -406,18 +426,22 @@ class NextDayPredictor:
             "You are a next-day SL-hunting prediction engine for NIFTY/BANKNIFTY. "
             "Use ONLY the provided historical context, OI snapshot (if present), and retrieved rulebook rules. "
             "For each gap bucket, output actionable levels (operator zones, liquidity pools) and a one-sided bias for that bucket. "
-            "Be conservative: if unsure for a bucket, set its plan to WAIT and explain briefly. "
+            "You MUST output exactly 10 gap_plans (one per provided gap_buckets key). "
+            "Be conservative: if unsure for a bucket, set bias=WAIT and set entry_zone/operator_zone/no_trade_zone/sl to null (targets/liquidity_pools/reason_points still required). "
+            "Keep arrays small: targets max 3 numbers; liquidity_pools max 3 numbers; reason_points max 3 short points. "
             "All strings must be SINGLE-LINE (no raw newlines). If needed, use '\\n' inside strings. "
             "Output STRICT JSON only. No markdown. No comments. No trailing commas. Use double quotes for all JSON keys/strings."
         )
 
         body = {
-            "contents": [{"role": "user", "parts": [{"text": sys + "\n\n" + json.dumps(prompt_payload, ensure_ascii=False)}]}],
+            "systemInstruction": {"parts": [{"text": sys}]},
+            "contents": [{"role": "user", "parts": [{"text": json.dumps(prompt_payload, ensure_ascii=False)}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 1200,
+                "maxOutputTokens": 1400,
                 "responseMimeType": "application/json",
-                "responseSchema": schema,
+                # Use JSON Schema structured outputs for reliable JSON.
+                "responseJsonSchema": schema,
             },
         }
 
@@ -507,11 +531,14 @@ class NextDayPredictor:
         last_err: str | None = None
         try:
             data: dict | None = None
+            schema_dropped = False
             with httpx.Client(timeout=self.timeout_s) as client:
                 for attempt in range(1, int(self.max_retries) + 1):
                     r = client.post(url, params=params, json=body)
-                    if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
-                        body["generationConfig"].pop("responseSchema", None)
+                    if r.status_code >= 400 and "responseJsonSchema" in body["generationConfig"]:
+                        # Older deployments may not support schemas. Drop and retry.
+                        body["generationConfig"].pop("responseJsonSchema", None)
+                        schema_dropped = True
                         r = client.post(url, params=params, json=body)
                     try:
                         r.raise_for_status()
@@ -522,18 +549,30 @@ class NextDayPredictor:
                             continue
                         raise
                     data = r.json()
-                    break
+                    text = _extract_candidate_text(data)
+                    if not text:
+                        if attempt < int(self.max_retries):
+                            time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                            continue
+                        raise ValueError("empty_candidate_text")
+                    try:
+                        out = _extract_json(text)
+                        break
+                    except Exception as pe:
+                        # If schema had to be dropped, parsing can still fail; retry a couple times.
+                        if attempt < int(self.max_retries):
+                            time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                            continue
+                        raise pe
 
-            if data is None:
-                raise RuntimeError("gemini_error: empty response")
-
-            text = _extract_candidate_text(data)
-            out = _extract_json(text)
+            if out is None:
+                raise RuntimeError("gemini_error: empty_or_unparseable_response" + (" (schema_dropped)" if schema_dropped else ""))
         except Exception as e:
             last_err = _sanitize_error(str(e))
             # One parse retry: no schema.
             try:
                 body2 = {
+                    "systemInstruction": body.get("systemInstruction"),
                     "contents": body["contents"],
                     "generationConfig": {
                         "temperature": 0,

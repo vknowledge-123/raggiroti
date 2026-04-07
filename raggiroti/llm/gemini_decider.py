@@ -29,6 +29,13 @@ def _extract_candidate_text(data: dict) -> str:
         for p in parts:
             if isinstance(p, dict) and isinstance(p.get("text"), str):
                 texts.append(p["text"])
+            # Some deployments may return JSON as inlineData; treat as UTF-8 text if present.
+            inline = p.get("inlineData") if isinstance(p, dict) else None
+            if isinstance(inline, dict) and isinstance(inline.get("data"), str):
+                try:
+                    texts.append(inline["data"])
+                except Exception:
+                    pass
         return "\n".join(texts).strip()
     except Exception:
         return ""
@@ -121,15 +128,16 @@ class GeminiDecider:
 
         # Prefer Gemini structured output when available; fallback to prompt-only JSON.
         body = {
-            "contents": [
-                {"role": "user", "parts": [{"text": sys + "\n\n" + json.dumps(payload, ensure_ascii=False)}]}
-            ],
+            "systemInstruction": {"parts": [{"text": sys}]},
+            "contents": [{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}],
             "generationConfig": {
                 "temperature": 0,
                 "maxOutputTokens": 180,
                 "responseMimeType": "application/json",
-                # Some Gemini deployments support JSON schema; if rejected, we will retry without it.
-                "responseSchema": schema,
+                # Use JSON Schema via GenerationConfig.responseJsonSchema (Gemini structured outputs).
+                # responseSchema is a different (OpenAPI-subset) schema type; mixing formats causes 400s and disables
+                # structured output, leading to invalid/truncated JSON in the wild.
+                "responseJsonSchema": schema,
             },
         }
 
@@ -142,9 +150,9 @@ class GeminiDecider:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
                     r = client.post(url, params=params, json=body)
-                    if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
+                    if r.status_code >= 400 and "responseJsonSchema" in body["generationConfig"]:
                         # Retry without schema if the endpoint does not support it.
-                        body["generationConfig"].pop("responseSchema", None)
+                        body["generationConfig"].pop("responseJsonSchema", None)
                         r = client.post(url, params=params, json=body)
                     try:
                         r.raise_for_status()
@@ -156,6 +164,9 @@ class GeminiDecider:
                         # Non-transient: don't retry; bubble up.
                         raise
                     data = r.json()
+                    # Treat empty candidate text as transient: retry (it happens occasionally with JSON mode).
+                    if not _extract_candidate_text(data):
+                        raise ValueError("empty_candidate_text")
                     last_err = None
                     break
                 except httpx.HTTPStatusError as e:
@@ -168,6 +179,12 @@ class GeminiDecider:
                         # Small exponential backoff; keep overall latency bounded.
                         time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
                         continue
+                except ValueError as e:
+                    last_err = _sanitize_error(str(e))
+                    if str(e) == "empty_candidate_text" and attempt < int(self.max_retries):
+                        time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                        continue
+                    break
                 except Exception as e:
                     last_err = _sanitize_error(str(e))
                     break

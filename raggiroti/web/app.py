@@ -34,7 +34,12 @@ from raggiroti.llm.gemini_rule_extractor import GeminiRuleExtractor
 from raggiroti.rules.rulebook_merge import merge_rule_proposal_into_rulebook
 from raggiroti.rules.rulebook_loader import load_rulebook
 from raggiroti.dhan.live_feed import DhanLiveFeed, LiveFeedInstrument, parse_marketfeed_tick
-from raggiroti.dhan.option_chain import DhanOptionChainClient, summarize_oi_walls, summarize_oi_walls_any
+from raggiroti.dhan.option_chain import (
+    DhanOptionChainClient,
+    summarize_oi_walls,
+    summarize_oi_walls_any,
+    summarize_oi_walls_plaintext,
+)
 from raggiroti.live.candle_builder import CandleBuilder1m
 from raggiroti.live.models import Tick
 from raggiroti.live.live_sim_engine import LiveSimEngine
@@ -560,8 +565,8 @@ def home() -> str:
         <input name="target_date" placeholder="2026-04-07" required />
         <label>Use previous trading day OI snapshot (0/1)</label>
         <input name="use_prev_day_oi" value="1" />
-        <label>Manual OI JSON (optional; NSE JSON supported)</label>
-        <textarea id="oi_manual_json" style="width:100%; max-width:880px; height:110px; padding:10px;"></textarea>
+        <label>Manual OI (JSON or Plain Text)</label>
+        <textarea id="oi_manual_json" style="width:100%; max-width:880px; height:130px; padding:10px;" placeholder="Paste NSE option-chain JSON OR the copied option-chain table text here."></textarea>
         <div class="row">
           <div>
             <label>Manual OI date (YYYY-MM-DD)</label>
@@ -895,7 +900,7 @@ def home() -> str:
         const form = new FormData();
         form.set('symbol', symbol.toString());
         form.set('date', (document.getElementById('oi_manual_date').value || '').trim());
-        form.set('json_text', document.getElementById('oi_manual_json').value || '');
+        form.set('text', document.getElementById('oi_manual_json').value || '');
         const r = await fetch('/api/oi/snapshot/manual', { method: 'POST', body: form });
         const t = await r.text();
         let j = null;
@@ -1925,12 +1930,13 @@ def oi_snapshot_list(symbol: str | None = None, date: str | None = None, limit: 
 
 
 @app.post("/api/oi/snapshot/manual")
-def oi_snapshot_manual(symbol: str = Form(...), date: str = Form(...), json_text: str = Form(...)) -> JSONResponse:
+def oi_snapshot_manual(symbol: str = Form(...), date: str = Form(...), text: str = Form(...)) -> JSONResponse:
     """
     Save a manual OI snapshot for a specific trading day.
     You can paste:
     - our compact summary JSON (ce_walls/pe_walls)
     - NSE option-chain JSON (records.data...)
+    - NSE option-chain TABLE copied as plain text (tab-separated)
     """
     settings = get_settings()
     sym = str(symbol).upper().strip()
@@ -1939,11 +1945,19 @@ def oi_snapshot_manual(symbol: str = Form(...), date: str = Form(...), json_text
     d = (date or "").strip()
     if not d:
         return JSONResponse({"ok": False, "error": "date is required (YYYY-MM-DD)"}, status_code=400)
+    payload = (text or "").strip()
+    if not payload:
+        return JSONResponse({"ok": False, "error": "text is required"}, status_code=400)
+
+    summary = None
+    # Try JSON first
     try:
-        raw = json.loads(json_text or "")
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"invalid JSON: {e}"}, status_code=400)
-    summary = summarize_oi_walls_any(raw, top_n=5)
+        raw = json.loads(payload)
+        summary = summarize_oi_walls_any(raw, top_n=5)
+    except Exception:
+        # Fallback: plain text table
+        summary = summarize_oi_walls_plaintext(payload, top_n=5)
+
     if not isinstance(summary, dict) or not summary.get("ok"):
         return JSONResponse({"ok": False, "error": "could not convert payload to OI wall summary", "raw": summary}, status_code=400)
 

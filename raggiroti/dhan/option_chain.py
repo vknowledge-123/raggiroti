@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from raggiroti.dhan.session import DhanUnavailable
 
@@ -19,6 +20,24 @@ def _to_float(x) -> float | None:
         if x is None:
             return None
         return float(x)
+    except Exception:
+        return None
+
+
+def _to_float_india(x) -> float | None:
+    """
+    Parses NSE-style numeric strings:
+    - commas as thousand separators: "2,70,790" -> 270790
+    - missing: "-" -> None
+    """
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s == "-" or s.lower() == "na":
+        return None
+    s = s.replace(",", "")
+    try:
+        return float(s)
     except Exception:
         return None
 
@@ -135,6 +154,86 @@ def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
         pass
 
     return summarize_oi_walls(payload, top_n=top_n)
+
+
+def summarize_oi_walls_plaintext(text: str, top_n: int = 5) -> dict:
+    """
+    Parses NSE option-chain table copied as plain text (tab-separated) and converts it into our compact OI walls summary.
+
+    Expected columns (typical NSE):
+    CALL: OI, Chng in OI, Volume, IV, LTP, Chng, BID QTY, BID, ASK, ASK QTY,
+    MID: Strike,
+    PUT: BID QTY, BID, ASK, ASK QTY, Chng, LTP, IV, Volume, Chng in OI, OI
+
+    We only need: strike, CE OI (+ change), PE OI (+ change), and optional LTP.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {"ok": False, "error": "empty plaintext"}
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return {"ok": False, "error": "not enough lines"}
+
+    header = lines[0]
+    # Detect delimiter (NSE copy is usually tabs).
+    delim = "\t" if "\t" in header else None
+
+    def split_line(ln: str) -> list[str]:
+        if delim:
+            return [x.strip() for x in ln.split("\t")]
+        # fallback: split on 2+ spaces
+        return [x.strip() for x in re.split(r"\s{2,}", ln.strip()) if x.strip()]
+
+    head_cols = split_line(header)
+    strike_idx = None
+    for i, c in enumerate(head_cols):
+        if c.lower() == "strike":
+            strike_idx = i
+            break
+    # Fallback: NSE sometimes has "Strike" in the middle; assume 10 if unknown.
+    if strike_idx is None:
+        strike_idx = 10
+
+    ce: list[OIWall] = []
+    pe: list[OIWall] = []
+
+    for ln in lines[1:]:
+        cols = split_line(ln)
+        # Skip clearly malformed lines
+        if len(cols) < (strike_idx + 1):
+            continue
+        strike = _to_float_india(cols[strike_idx])
+        if strike is None:
+            continue
+
+        # CALL side indices (by convention)
+        ce_oi = _to_float_india(cols[0]) if len(cols) > 0 else None
+        ce_oi_chg = _to_float_india(cols[1]) if len(cols) > 1 else None
+        ce_ltp = _to_float_india(cols[4]) if len(cols) > 4 else None
+
+        # PUT side indices relative to strike column
+        # After strike: BID QTY, BID, ASK, ASK QTY, Chng, LTP, IV, Volume, Chng in OI, OI
+        pe_ltp = _to_float_india(cols[strike_idx + 6]) if len(cols) > (strike_idx + 6) else None
+        pe_oi_chg = _to_float_india(cols[strike_idx + 9]) if len(cols) > (strike_idx + 9) else None
+        pe_oi = _to_float_india(cols[strike_idx + 10]) if len(cols) > (strike_idx + 10) else None
+        # Fallback from the end (if there are extra spaces/columns, last 2 should still be chg_oi, oi)
+        if pe_oi is None and len(cols) >= 2:
+            pe_oi = _to_float_india(cols[-1])
+        if pe_oi_chg is None and len(cols) >= 2:
+            pe_oi_chg = _to_float_india(cols[-2])
+
+        if ce_oi is not None:
+            ce.append(OIWall(strike=float(strike), side="CE", oi=float(ce_oi), oi_change=ce_oi_chg, ltp=ce_ltp))
+        if pe_oi is not None:
+            pe.append(OIWall(strike=float(strike), side="PE", oi=float(pe_oi), oi_change=pe_oi_chg, ltp=pe_ltp))
+
+    if not ce and not pe:
+        return {"ok": False, "error": "no strike rows parsed from plaintext"}
+
+    ce_sorted = sorted(ce, key=lambda x: x.oi, reverse=True)[: int(top_n)]
+    pe_sorted = sorted(pe, key=lambda x: x.oi, reverse=True)[: int(top_n)]
+    return {"ok": True, "ce_walls": [w.__dict__ for w in ce_sorted], "pe_walls": [w.__dict__ for w in pe_sorted]}
 
 
 def derive_oi_features(*, spot_price: float | None, snapshot: dict | None) -> dict:
