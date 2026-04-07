@@ -134,6 +134,120 @@ def _gemini_feedback(data: dict) -> dict:
     except Exception:
         return {}
 
+def _single_line(s: str) -> str:
+    return (s or "").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _sanitize_reason_for_bias(reason: str, bias: str) -> str:
+    """
+    Ensure reason_points do not suggest both-side entries.
+    - If bias=BUY, remove short/sell language.
+    - If bias=SELL, remove long/buy language.
+    - If bias=WAIT, caller should replace reasons with WAIT-only reasons.
+    """
+    txt = _single_line(reason)
+    if not txt:
+        return ""
+
+    lower = txt.lower()
+    # If a sentence explicitly contains both sides (common: "... for longs OR ... for shorts"),
+    # select the side consistent with bias.
+    if (" or " in lower) and ("long" in lower) and ("short" in lower):
+        # Split once; keep the clause that best matches bias.
+        parts = re.split(r"\bor\b", txt, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            left, right = parts[0].strip(" ,.;"), parts[1].strip(" ,.;")
+            llow, rlow = left.lower(), right.lower()
+            if bias == "BUY":
+                txt = left if ("reclaim" in llow or "long" in llow or "buy" in llow) else right
+            elif bias == "SELL":
+                txt = left if ("reject" in llow or "short" in llow or "sell" in llow) else right
+
+    # Remove explicit opposite-side guidance.
+    if bias == "BUY":
+        txt = re.sub(r"\bfor\s+shorts?\b", "", txt, flags=re.IGNORECASE).strip()
+        txt = re.sub(r"\bshorts?\b", "", txt, flags=re.IGNORECASE).strip()
+        txt = re.sub(r"\bsell\b", "", txt, flags=re.IGNORECASE).strip()
+    elif bias == "SELL":
+        txt = re.sub(r"\bfor\s+longs?\b", "", txt, flags=re.IGNORECASE).strip()
+        txt = re.sub(r"\blongs?\b", "", txt, flags=re.IGNORECASE).strip()
+        txt = re.sub(r"\bbuy\b", "", txt, flags=re.IGNORECASE).strip()
+
+    # Cleanup repeated spaces/punctuation remnants.
+    txt = re.sub(r"\s{2,}", " ", txt).strip(" ,.;")
+    return txt
+
+
+def _sanitize_prediction_output(out: dict) -> dict:
+    """
+    Post-process Gemini output to enforce product constraints:
+    - No both-side guidance in reason_points.
+    - WAIT plans must not contain entry/SL zones.
+    - Keep arrays small to reduce token/noise in UI.
+    """
+    if not isinstance(out, dict):
+        return out
+
+    # summary_points single-line
+    if isinstance(out.get("summary_points"), list):
+        out["summary_points"] = [_single_line(str(x)) for x in out["summary_points"] if _single_line(str(x))][:8]
+
+    plans = out.get("gap_plans")
+    if not isinstance(plans, list):
+        return out
+
+    new_plans = []
+    for p in plans:
+        if not isinstance(p, dict):
+            continue
+        bias = str(p.get("bias") or "WAIT").upper()
+        if bias not in {"BUY", "SELL", "WAIT"}:
+            bias = "WAIT"
+        p["bias"] = bias
+
+        # Normalize arrays
+        if not isinstance(p.get("targets"), list):
+            p["targets"] = []
+        if not isinstance(p.get("liquidity_pools"), list):
+            p["liquidity_pools"] = []
+        p["targets"] = [float(x) for x in p["targets"][:3] if isinstance(x, (int, float))]
+        p["liquidity_pools"] = [float(x) for x in p["liquidity_pools"][:3] if isinstance(x, (int, float))]
+
+        # reasons
+        reasons = p.get("reason_points")
+        if not isinstance(reasons, list):
+            reasons = []
+
+        if bias == "WAIT":
+            # Enforce WAIT = no entry, no SL.
+            p["entry_zone"] = None
+            p["operator_zone"] = None
+            p["no_trade_zone"] = p.get("no_trade_zone") if isinstance(p.get("no_trade_zone"), list) else None
+            p["sl"] = None
+            p["reason_points"] = [
+                "WAIT: no one-sided confirmation for this gap bucket.",
+                "Avoid both-side entries; wait for clear acceptance/rejection at key levels.",
+            ][:3]
+        else:
+            cleaned = []
+            for r in reasons:
+                rr = _sanitize_reason_for_bias(str(r), bias=bias)
+                if rr:
+                    cleaned.append(rr)
+            cleaned = [_single_line(x) for x in cleaned if _single_line(x)][:3]
+            if not cleaned:
+                cleaned = [
+                    (f"Bias={bias}: wait for sweep + reclaim (BUY) or sweep + reject (SELL) at key liquidity.")
+                    if bias in {"BUY", "SELL"}
+                    else "WAIT.",
+                ]
+            p["reason_points"] = cleaned
+
+        new_plans.append(p)
+
+    out["gap_plans"] = new_plans
+    return out
+
 def _truncate(s: str, n: int = 240) -> str:
     s = (s or "").strip()
     if len(s) <= n:
@@ -258,12 +372,21 @@ class NextDayPredictor:
         for c in prev_day_candles:
             last_state = sb.update(c)
         swings = {}
+        dow = {}
         if isinstance(last_state, dict):
             swings = {
                 "last_swing_high_1m": last_state.get("last_swing_high_1m"),
                 "last_swing_low_1m": last_state.get("last_swing_low_1m"),
                 "last_swing_high_5m": last_state.get("last_swing_high_5m"),
                 "last_swing_low_5m": last_state.get("last_swing_low_5m"),
+            }
+            dow = {
+                "dow_structure_1m": last_state.get("dow_structure_1m") or last_state.get("structure_1m") or last_state.get("structure"),
+                "dow_structure_5m": last_state.get("dow_structure_5m") or last_state.get("structure_5m"),
+                "market_type": last_state.get("market_type"),
+                "comfort_risk": last_state.get("comfort_risk"),
+                "operator_exit_risk": last_state.get("operator_exit_risk"),
+                "overcrowding_risk": last_state.get("overcrowding_risk"),
             }
 
         stats = {
@@ -279,6 +402,7 @@ class NextDayPredictor:
                 else float((prev_levels.close - prev_levels.low) / (prev_levels.high - prev_levels.low))
             ),
             "swings": swings,
+            "dow": dow,
         }
 
         # Previous-day OI snapshot (captured and stored in DB).
@@ -301,6 +425,8 @@ class NextDayPredictor:
 
         # Gap buckets (points from prev_close)
         gap_buckets = [
+            # Flat opening = within +/- 30 points of prev close.
+            {"key": "flat_open_30", "type": "flat", "min": -30, "max": 30},
             {"key": "gap_up_50_100", "type": "gap_up", "min": 50, "max": 100},
             {"key": "gap_up_100_150", "type": "gap_up", "min": 100, "max": 150},
             {"key": "gap_up_150_200", "type": "gap_up", "min": 150, "max": 200},
@@ -316,7 +442,8 @@ class NextDayPredictor:
         # Retrieval for planning prompt
         retrieval_state = {
             "zone": "fair",
-            "gap_type": "gap_up",
+            # Multi-regime prediction: do not bias retrieval only to gap-up rules.
+            "gap_type": "multi",
             "structure": "unknown",
             "market_type": "unknown",
             "validity_ok": True,
@@ -330,6 +457,7 @@ class NextDayPredictor:
             "reclaimed_last_swing_low": False,
             "reclaimed_prev_pdh": False,
             "reclaimed_prev_pdl": False,
+            "dow": dow,
             "oi": oi_features or {"ok": False},
         }
         retrieved = retrieve_rulebook_rules(self.rulebook_path, retrieval_state, limit=18)
@@ -433,7 +561,7 @@ class NextDayPredictor:
                     },
                     "required": ["prev_close", "PDH", "PDL", "operator_sell_zone", "operator_buy_zone", "no_trade_zone"],
                 },
-                "gap_plans": {"type": "array", "items": bucket_schema, "minItems": 10, "maxItems": 10},
+                "gap_plans": {"type": "array", "items": bucket_schema, "minItems": 11, "maxItems": 11},
             },
             "required": ["summary_points", "base_levels", "gap_plans"],
         }
@@ -442,7 +570,7 @@ class NextDayPredictor:
             "You are a next-day SL-hunting prediction engine for NIFTY/BANKNIFTY. "
             "Use ONLY the provided historical context, OI snapshot (if present), and retrieved rulebook rules. "
             "For each gap bucket, output actionable levels (operator zones, liquidity pools) and a one-sided bias for that bucket. "
-            "You MUST output exactly 10 gap_plans (one per provided gap_buckets key). "
+            "You MUST output exactly 11 gap_plans (one per provided gap_buckets key). "
             "Be conservative: if unsure for a bucket, set bias=WAIT and set entry_zone/operator_zone/no_trade_zone/sl to null (targets/liquidity_pools/reason_points still required). "
             "Keep arrays small: targets max 3 numbers; liquidity_pools max 3 numbers; reason_points max 3 short points. "
             "Keep each string very short (<= 180 chars). Do not repeat input payload. Do not add explanations outside JSON. "
@@ -494,11 +622,14 @@ class NextDayPredictor:
                     gmin = float(b.get("min") or 0.0)
                     gmax = float(b.get("max") or (gmin + 50.0))
                     open_zone = [pc + gmin, pc + gmax]
-                else:
+                elif typ == "gap_down":
                     # negative points
                     gmin = float(b.get("min") if b.get("min") is not None else (-(abs(b.get("max") or 250.0) + 50.0)))
                     gmax = float(b.get("max") or -50.0)
                     open_zone = [pc + gmin, pc + gmax]
+                else:
+                    # flat within +/- 30
+                    open_zone = [pc - 30.0, pc + 30.0]
 
                 if typ == "gap_up":
                     bias = "SELL"
@@ -511,7 +642,7 @@ class NextDayPredictor:
                         sl = pdh + 30.0
                     targets = [pc, q1, pdl]
                     pools = [pdh, pc, pdl]
-                else:
+                elif typ == "gap_down":
                     bias = "BUY"
                     if open_zone[1] <= (pdl - 40.0):
                         entry_zone = [open_zone[0] - 10.0, open_zone[1] + 10.0]
@@ -521,6 +652,34 @@ class NextDayPredictor:
                         sl = pdl - 30.0
                     targets = [pc, q3, pdh]
                     pools = [pdl, pc, pdh]
+                else:
+                    # Flat opening: derive a conservative bias from OI + prior trend/close location.
+                    bias = "WAIT"
+                    try:
+                        b0 = (oi_features or {}).get("features", {}).get("oi_bias")
+                        if str(b0).lower() == "bullish":
+                            bias = "BUY"
+                        elif str(b0).lower() == "bearish":
+                            bias = "SELL"
+                    except Exception:
+                        pass
+
+                    # Prefer mid-range scalps only after liquidity sweep; keep tight risk.
+                    if bias == "BUY":
+                        entry_zone = [pc - 20.0, pc - 5.0]
+                        sl = pc - 40.0
+                        targets = [pc + 20.0, q3, pdh]
+                        pools = [pc, q3, pdh]
+                    elif bias == "SELL":
+                        entry_zone = [pc + 5.0, pc + 20.0]
+                        sl = pc + 40.0
+                        targets = [pc - 20.0, q1, pdl]
+                        pools = [pc, q1, pdl]
+                    else:
+                        entry_zone = None
+                        sl = None
+                        targets = [pc, q1, q3]
+                        pools = [pc, q1, q3]
                 return {
                     "bucket_key": k,
                     "gap_points_min": None if b.get("min") is None else float(b.get("min")),
@@ -624,6 +783,9 @@ class NextDayPredictor:
 
         # Cache only valid Gemini outputs. Do NOT cache fallbacks; otherwise a transient Gemini failure
         # would permanently poison future predictions for the same payload/model.
+        # Always sanitize output before caching/returning.
+        out = _sanitize_prediction_output(out if isinstance(out, dict) else {})
+
         if not (isinstance(out, dict) and out.get("_fallback") is True):
             cache_id = f"pred_{req_hash[:16]}"
             store.set_llm_cache(cache_id, datetime.now(timezone.utc).isoformat(), self.model, req_hash, out)
