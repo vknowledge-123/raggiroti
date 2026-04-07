@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -14,6 +15,23 @@ from raggiroti.storage.sqlite_db import SqliteStore
 def _hash_request(payload: dict) -> str:
     s = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _extract_candidate_text(data: dict) -> str:
+    """
+    Extracts text from Gemini generateContent response robustly.
+    Gemini may return multiple parts; we concatenate all text parts.
+    """
+    try:
+        cand = (data.get("candidates") or [{}])[0] or {}
+        content = cand.get("content") or {}
+        parts = content.get("parts") or []
+        texts: list[str] = []
+        for p in parts:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                texts.append(p["text"])
+        return "\n".join(texts).strip()
+    except Exception:
+        return ""
 
 
 def _extract_json(text: str) -> dict:
@@ -64,6 +82,8 @@ class GeminiDecider:
     db_path: str
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout_s: float = 15.0
+    max_retries: int = 3
+    retry_backoff_s: float = 0.6
 
     def decide(self, state: dict, retrieved: dict) -> dict:
         payload = {"state": state, "retrieved": retrieved, "schema_version": 1}
@@ -113,30 +133,51 @@ class GeminiDecider:
             },
         }
 
-        url = f"{self.base_url}/models/{self.model}:generateContent"
         # Normalize model id to avoid "/models/models/..." 404s when users copy from ListModels.
         url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
         params = {"key": self.api_key}
-        try:
-            with httpx.Client(timeout=self.timeout_s) as client:
-                r = client.post(url, params=params, json=body)
-                if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
-                    # Retry without schema if the endpoint does not support it.
-                    body["generationConfig"].pop("responseSchema", None)
+        data: dict | None = None
+        last_err: str | None = None
+        with httpx.Client(timeout=self.timeout_s) as client:
+            for attempt in range(1, int(self.max_retries) + 1):
+                try:
                     r = client.post(url, params=params, json=body)
-                r.raise_for_status()
-                data = r.json()
-        except Exception as e:
+                    if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
+                        # Retry without schema if the endpoint does not support it.
+                        body["generationConfig"].pop("responseSchema", None)
+                        r = client.post(url, params=params, json=body)
+                    try:
+                        r.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        status = getattr(getattr(e, "response", None), "status_code", None)
+                        # Retry only on transient server/rate issues.
+                        if status in (429, 500, 502, 503, 504):
+                            raise
+                        # Non-transient: don't retry; bubble up.
+                        raise
+                    data = r.json()
+                    last_err = None
+                    break
+                except httpx.HTTPStatusError as e:
+                    last_err = _sanitize_error(str(e))
+                    # For non-transient codes, don't retry.
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if status not in (429, 500, 502, 503, 504):
+                        break
+                    if attempt < int(self.max_retries):
+                        # Small exponential backoff; keep overall latency bounded.
+                        time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                        continue
+                except Exception as e:
+                    last_err = _sanitize_error(str(e))
+                    break
+
+        if data is None:
             store.close()
-            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_error: {_sanitize_error(str(e))}"}
+            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_error: {last_err or 'unknown_error'}"}
 
         try:
-            text = (
-                data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-            )
+            text = _extract_candidate_text(data)
             out = _extract_json(text)
             # Basic sanity
             if out.get("action") not in {"BUY", "SELL", "WAIT", "EXIT"}:
@@ -144,8 +185,35 @@ class GeminiDecider:
             if not isinstance(out.get("targets"), list):
                 raise ValueError("targets must be list")
         except Exception as e:
-            store.close()
-            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_parse_error: {_sanitize_error(str(e))}"}
+            # One retry for parse errors: ask again with simpler settings (no schema, plain text JSON).
+            try:
+                body2 = {
+                    "contents": body["contents"],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "maxOutputTokens": 180,
+                        "responseMimeType": "application/json",
+                    },
+                }
+                with httpx.Client(timeout=self.timeout_s) as client:
+                    r2 = client.post(url, params=params, json=body2)
+                    r2.raise_for_status()
+                    data2 = r2.json()
+                text2 = _extract_candidate_text(data2)
+                out2 = _extract_json(text2)
+                if out2.get("action") not in {"BUY", "SELL", "WAIT", "EXIT"}:
+                    raise ValueError(f"invalid action: {out2.get('action')}")
+                if not isinstance(out2.get("targets"), list):
+                    raise ValueError("targets must be list")
+                out = out2
+            except Exception as e2:
+                store.close()
+                return {
+                    "action": "WAIT",
+                    "sl": None,
+                    "targets": [],
+                    "error": f"gemini_parse_error: {_sanitize_error(str(e))} / retry_failed: {_sanitize_error(str(e2))}",
+                }
 
         created_at = datetime.now(timezone.utc).isoformat()
         cache_id = f"gem_{req_hash[:16]}"
