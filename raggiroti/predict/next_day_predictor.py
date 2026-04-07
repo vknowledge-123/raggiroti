@@ -596,7 +596,7 @@ class NextDayPredictor:
 
         # Bump schema_version whenever the expected output contract changes (e.g., adding flat bucket),
         # otherwise older cached predictions can be returned with the wrong shape.
-        req_hash = _hash_request({"predict_next_day": prompt_payload, "schema_version": 2})
+        req_hash = _hash_request({"predict_next_day": prompt_payload, "schema_version": 3})
         store = SqliteStore(self.db_path)
         cached = store.get_llm_cache(req_hash, self.model)
         if cached is not None:
@@ -640,30 +640,43 @@ class NextDayPredictor:
         bucket_schema = {
             "type": "object",
             "additionalProperties": False,
+            "propertyOrdering": [
+                "bucket_key",
+                "gap_points_min",
+                "gap_points_max",
+                "bias",
+                "entry_zone",
+                "operator_zone",
+                "no_trade_zone",
+                "sl",
+                "targets",
+                "liquidity_pools",
+                "reason_points",
+            ],
             "properties": {
                 "bucket_key": {"type": "string"},
-                "gap_points_min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                "gap_points_max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                "gap_points_min": {"type": ["number", "null"]},
+                "gap_points_max": {"type": ["number", "null"]},
                 "bias": {"type": "string", "enum": ["BUY", "SELL", "WAIT"]},
                 "entry_zone": {
-                    "anyOf": [
-                        {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                        {"type": "null"},
-                    ]
+                    "type": ["array", "null"],
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
                 },
                 "operator_zone": {
-                    "anyOf": [
-                        {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                        {"type": "null"},
-                    ]
+                    "type": ["array", "null"],
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
                 },
                 "no_trade_zone": {
-                    "anyOf": [
-                        {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                        {"type": "null"},
-                    ]
+                    "type": ["array", "null"],
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
                 },
-                "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                "sl": {"type": ["number", "null"]},
                 "targets": {"type": "array", "items": {"type": "number"}, "maxItems": 5},
                 "liquidity_pools": {"type": "array", "items": {"type": "number"}, "maxItems": 8},
                 "reason_points": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
@@ -674,11 +687,13 @@ class NextDayPredictor:
         schema = {
             "type": "object",
             "additionalProperties": False,
+            "propertyOrdering": ["summary_points", "base_levels", "gap_plans"],
             "properties": {
                 "summary_points": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
                 "base_levels": {
                     "type": "object",
                     "additionalProperties": False,
+                    "propertyOrdering": ["prev_close", "PDH", "PDL", "operator_sell_zone", "operator_buy_zone", "no_trade_zone"],
                     "properties": {
                         "prev_close": {"type": "number"},
                         "PDH": {"type": "number"},
@@ -719,10 +734,8 @@ class NextDayPredictor:
                 "temperature": 0,
                 "maxOutputTokens": 4096,
                 "responseMimeType": "application/json",
-                # Gemini API supports JSON Schema via the special `_responseJsonSchema` field.
-                # Using `responseJsonSchema` has been observed to be ignored in some deployments (internal-detail field),
-                # leading to schema not being enforced and single-bucket outputs.
-                "_responseJsonSchema": schema,
+                # Structured outputs (JSON Schema) per Gemini API docs (REST: generationConfig.responseJsonSchema).
+                "responseJsonSchema": schema,
             },
         }
 
@@ -859,30 +872,43 @@ class NextDayPredictor:
             bucket_only_schema = {
                 "type": "object",
                 "additionalProperties": False,
+                "propertyOrdering": [
+                    "bucket_key",
+                    "gap_points_min",
+                    "gap_points_max",
+                    "bias",
+                    "entry_zone",
+                    "operator_zone",
+                    "no_trade_zone",
+                    "sl",
+                    "targets",
+                    "liquidity_pools",
+                    "reason_points",
+                ],
                 "properties": {
                     "bucket_key": {"type": "string"},
-                    "gap_points_min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-                    "gap_points_max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "gap_points_min": {"type": ["number", "null"]},
+                    "gap_points_max": {"type": ["number", "null"]},
                     "bias": {"type": "string", "enum": ["BUY", "SELL", "WAIT"]},
                     "entry_zone": {
-                        "anyOf": [
-                            {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                            {"type": "null"},
-                        ]
+                        "type": ["array", "null"],
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
                     },
                     "operator_zone": {
-                        "anyOf": [
-                            {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                            {"type": "null"},
-                        ]
+                        "type": ["array", "null"],
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
                     },
                     "no_trade_zone": {
-                        "anyOf": [
-                            {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                            {"type": "null"},
-                        ]
+                        "type": ["array", "null"],
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
                     },
-                    "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "sl": {"type": ["number", "null"]},
                     "targets": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3},
                     "liquidity_pools": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3},
                     "reason_points": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
@@ -919,15 +945,14 @@ class NextDayPredictor:
                     "temperature": 0,
                     "maxOutputTokens": 700,
                     "responseMimeType": "application/json",
-                    "_responseJsonSchema": bucket_only_schema,
+                    "responseJsonSchema": bucket_only_schema,
                 },
             }
 
             try:
                 r = client.post(url, headers=headers, json=body_bucket)
-                if r.status_code >= 400 and ("_responseJsonSchema" in body_bucket["generationConfig"] or "responseSchema" in body_bucket["generationConfig"]):
-                    body_bucket["generationConfig"].pop("_responseJsonSchema", None)
-                    body_bucket["generationConfig"].pop("responseSchema", None)
+                if r.status_code >= 400 and ("responseJsonSchema" in body_bucket["generationConfig"]):
+                    body_bucket["generationConfig"].pop("responseJsonSchema", None)
                     r = client.post(url, headers=headers, json=body_bucket)
                 r.raise_for_status()
                 data = r.json()
@@ -979,9 +1004,8 @@ class NextDayPredictor:
             with httpx.Client(timeout=self.timeout_s) as client:
                 for attempt in range(1, int(self.max_retries) + 1):
                     r = client.post(url, headers=headers, json=body)
-                    if r.status_code >= 400 and ("_responseJsonSchema" in body["generationConfig"] or "responseJsonSchema" in body["generationConfig"]):
+                    if r.status_code >= 400 and ("responseJsonSchema" in body["generationConfig"]):
                         # Older deployments may not support schemas. Drop and retry.
-                        body["generationConfig"].pop("_responseJsonSchema", None)
                         body["generationConfig"].pop("responseJsonSchema", None)
                         schema_dropped = True
                         r = client.post(url, headers=headers, json=body)
@@ -1043,12 +1067,11 @@ class NextDayPredictor:
                         "temperature": 0,
                         "maxOutputTokens": 4096,
                         "responseMimeType": "application/json",
-                        "_responseJsonSchema": schema,
+                        "responseJsonSchema": schema,
                     },
                 }
                 r3 = client.post(url, headers=headers, json=body_repair)
-                if r3.status_code >= 400 and ("_responseJsonSchema" in body_repair["generationConfig"] or "responseJsonSchema" in body_repair["generationConfig"]):
-                    body_repair["generationConfig"].pop("_responseJsonSchema", None)
+                if r3.status_code >= 400 and ("responseJsonSchema" in body_repair["generationConfig"]):
                     body_repair["generationConfig"].pop("responseJsonSchema", None)
                     r3 = client.post(url, headers=headers, json=body_repair)
                 r3.raise_for_status()

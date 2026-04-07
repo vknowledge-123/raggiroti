@@ -93,6 +93,7 @@ class GeminiRuleExtractor:
         schema = {
             "type": "object",
             "additionalProperties": False,
+            "propertyOrdering": ["summary", "rules", "conflicts"],
             "properties": {
                 "summary": {"type": "string"},
                 "rules": {
@@ -100,6 +101,7 @@ class GeminiRuleExtractor:
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
+                        "propertyOrdering": ["category", "name", "condition", "interpretation", "action", "tags"],
                         "properties": {
                             "category": {"type": "string"},
                             "name": {"type": "string"},
@@ -116,6 +118,7 @@ class GeminiRuleExtractor:
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
+                        "propertyOrdering": ["topic", "note"],
                         "properties": {"topic": {"type": "string"}, "note": {"type": "string"}},
                         "required": ["topic", "note"],
                     },
@@ -145,7 +148,7 @@ class GeminiRuleExtractor:
                 "maxOutputTokens": 1200,
                 "responseMimeType": "application/json",
                 # Use JSON Schema structured outputs.
-                "_responseJsonSchema": schema,
+                "responseJsonSchema": schema,
             },
         }
 
@@ -158,9 +161,8 @@ class GeminiRuleExtractor:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
                     r = client.post(url, headers=headers, json=body)
-                    if r.status_code >= 400 and ("_responseJsonSchema" in body["generationConfig"] or "responseJsonSchema" in body["generationConfig"]):
+                    if r.status_code >= 400 and ("responseJsonSchema" in body["generationConfig"]):
                         # Older deployments may not support schemas; retry without it.
-                        body["generationConfig"].pop("_responseJsonSchema", None)
                         body["generationConfig"].pop("responseJsonSchema", None)
                         r = client.post(url, headers=headers, json=body)
                     r.raise_for_status()

@@ -123,9 +123,11 @@ class GeminiDecider:
         schema = {
             "type": "object",
             "additionalProperties": False,
+            "propertyOrdering": ["action", "sl", "targets"],
             "properties": {
                 "action": {"type": "string", "enum": ["BUY", "SELL", "WAIT", "EXIT"]},
-                "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                # Gemini structured outputs supports a subset of JSON Schema. Prefer type-unions over anyOf/oneOf.
+                "sl": {"type": ["number", "null"]},
                 "targets": {"type": "array", "items": {"type": "number"}},
             },
             "required": ["action", "sl", "targets"],
@@ -161,10 +163,8 @@ class GeminiDecider:
                 "temperature": 0,
                 "maxOutputTokens": 256,
                 "responseMimeType": "application/json",
-                # Use JSON Schema via GenerationConfig.responseJsonSchema (Gemini structured outputs).
-                # responseSchema is a different (OpenAPI-subset) schema type; mixing formats causes 400s and disables
-                # structured output, leading to invalid/truncated JSON in the wild.
-                "_responseJsonSchema": schema,
+                # Structured outputs (JSON Schema) per Gemini API docs (REST: generationConfig.responseJsonSchema).
+                "responseJsonSchema": schema,
             },
         }
 
@@ -178,9 +178,8 @@ class GeminiDecider:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
                     r = client.post(url, headers=headers, json=body)
-                    if r.status_code >= 400 and ("_responseJsonSchema" in body["generationConfig"] or "responseJsonSchema" in body["generationConfig"]):
+                    if r.status_code >= 400 and ("responseJsonSchema" in body["generationConfig"]):
                         # Retry without schema if the endpoint does not support it.
-                        body["generationConfig"].pop("_responseJsonSchema", None)
                         body["generationConfig"].pop("responseJsonSchema", None)
                         r = client.post(url, headers=headers, json=body)
                     try:
