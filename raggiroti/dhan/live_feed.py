@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Callable
 
 from raggiroti.dhan.session import DhanUnavailable
 
 
+try:
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:  # pragma: no cover
+    # Some minimal Docker images don't ship tzdata/zoneinfo files.
+    _IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def _now_dt() -> datetime:
-    return datetime.now(tz=ZoneInfo("Asia/Kolkata"))
+    return datetime.now(tz=_IST)
 
 
 def _pick(d: dict, keys: list[str]) -> float | None:
@@ -98,11 +105,27 @@ class DhanLiveFeed:
         """
         Blocking loop that calls on_tick(raw_message).
         """
+        backoff = 0.5
+        # Connect once; reconnect on exceptions.
+        self.run_forever()
         while True:
-            self.run_forever()
-            msg = self.get_data()
-            if msg:
-                on_tick(msg)
+            try:
+                msg = self.get_data()
+                if msg:
+                    on_tick(msg)
+                backoff = 0.5
+            except Exception:
+                # Reconnect loop: disconnect, wait a bit, and connect again.
+                try:
+                    self.disconnect()
+                except Exception:
+                    pass
+                time.sleep(backoff)
+                backoff = min(backoff * 1.6, 8.0)
+                try:
+                    self.run_forever()
+                except Exception:
+                    continue
             if sleep_s > 0:
                 time.sleep(sleep_s)
 

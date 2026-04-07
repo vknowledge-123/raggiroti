@@ -67,3 +67,25 @@ class CandleBuilder1m:
         self.vol_last = tick.volume
         return candle
 
+    def current_snapshot(self) -> dict | None:
+        """
+        Returns the currently-forming candle (not yet closed) as a JSON-friendly dict.
+        Useful for dashboards so users see activity before the first minute-close.
+        """
+        if self.current_minute is None or self.o is None or self.h is None or self.l is None or self.c is None:
+            return None
+        vol = None
+        if self.vol_last is not None and self.vol0 is not None:
+            try:
+                vol = float(self.vol_last - self.vol0)
+            except Exception:
+                vol = None
+        return {
+            "dt": self.current_minute.isoformat(timespec="minutes"),
+            "open": float(self.o),
+            "high": float(self.h),
+            "low": float(self.l),
+            "close": float(self.c),
+            "volume": vol,
+            "partial": True,
+        }

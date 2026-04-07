@@ -12,6 +12,7 @@ from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from datetime import timedelta
 
 import anyio
 from fastapi import FastAPI, Form, Request, Query
@@ -90,9 +91,17 @@ LIVE_ERRORS: list[dict] = []
 LIVE_ERRORS_MAX = 200
 LIVE_TICK_COUNT = 0
 LIVE_LAST_TICK_AT: str | None = None
+LIVE_LAST_TICK_LTP: float | None = None
 LIVE_FEED_CONFIG: dict | None = None
 
 SIM_ENGINE: LiveSimEngine | None = None
+
+
+try:
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:  # pragma: no cover
+    # Some minimal Docker images don't ship tzdata/zoneinfo files.
+    _IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _push_live_error(kind: str, detail: object) -> None:
@@ -1039,8 +1048,7 @@ def _fetch_prev_trading_day_candles(*, security_id: str, access_token: str) -> t
     Best-effort previous-trading-day seeding using Dhan historical intraday candles.
     Returns (prev_date, candles_for_prev_date) or None.
     """
-    ist = ZoneInfo("Asia/Kolkata")
-    now_ist = datetime.now(tz=ist)
+    now_ist = datetime.now(tz=_IST)
     today = now_ist.strftime("%Y-%m-%d")
     # Pull a small lookback window to survive weekends/holidays.
     from_dt = (now_ist - timedelta(days=12)).replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=None)
@@ -1064,8 +1072,7 @@ def _fetch_prev_trading_day_candles(*, security_id: str, access_token: str) -> t
 
 
 def _today_ist_date() -> str:
-    ist = ZoneInfo("Asia/Kolkata")
-    return datetime.now(tz=ist).strftime("%Y-%m-%d")
+    return datetime.now(tz=_IST).strftime("%Y-%m-%d")
 
 
 def _start_live_thread(
@@ -1091,6 +1098,8 @@ def _start_live_thread(
     global LIVE_TICK_COUNT, LIVE_LAST_TICK_AT, LIVE_FEED_CONFIG
     LIVE_TICK_COUNT = 0
     LIVE_LAST_TICK_AT = None
+    global LIVE_LAST_TICK_LTP
+    LIVE_LAST_TICK_LTP = None
     LIVE_FEED_CONFIG = None
     with LIVE_LOCK:
         LIVE_FEED = None
@@ -1169,6 +1178,8 @@ def _start_live_thread(
                     global LIVE_TICK_COUNT, LIVE_LAST_TICK_AT
                     LIVE_TICK_COUNT += 1
                     LIVE_LAST_TICK_AT = dt.isoformat(timespec="seconds")
+                    global LIVE_LAST_TICK_LTP
+                    LIVE_LAST_TICK_LTP = float(ltp)
                 except Exception:
                     pass
                 tick = Tick(dt=dt, security_id=security_id, ltp=ltp, volume=vol)
@@ -1182,7 +1193,17 @@ def _start_live_thread(
                 # attach latest OI snapshot (optional)
                 if LIVE_OI_SNAPSHOT is not None:
                     pass
-                asyncio.run_coroutine_threadsafe(eng.on_candle_close(candle), LIVE_LOOP)
+                fut = asyncio.run_coroutine_threadsafe(eng.on_candle_close(candle), LIVE_LOOP)
+                # Make exceptions visible in the dashboard; otherwise they get swallowed.
+                def _done(f) -> None:
+                    try:
+                        f.result()
+                    except Exception as e:
+                        _push_live_error("engine_error", f"{type(e).__name__}: {e}")
+                try:
+                    fut.add_done_callback(_done)
+                except Exception:
+                    pass
 
             feed.iter_ticks(on_tick)
         except SystemExit:
@@ -1344,6 +1365,8 @@ def live_stop() -> JSONResponse:
         global LIVE_TICK_COUNT, LIVE_LAST_TICK_AT, LIVE_FEED_CONFIG
         LIVE_TICK_COUNT = 0
         LIVE_LAST_TICK_AT = None
+        global LIVE_LAST_TICK_LTP
+        LIVE_LAST_TICK_LTP = None
         LIVE_FEED_CONFIG = None
     except Exception:
         pass
@@ -1375,6 +1398,7 @@ def live_status() -> JSONResponse:
                 "engine_present": bool(LIVE_ENGINE is not None),
                 "tick_count": int(LIVE_TICK_COUNT),
                 "last_tick_at": LIVE_LAST_TICK_AT,
+                "last_tick_ltp": LIVE_LAST_TICK_LTP,
                 "feed_config": LIVE_FEED_CONFIG,
             }
         )
@@ -1395,6 +1419,7 @@ def live_status() -> JSONResponse:
             "engine_present": bool(LIVE_ENGINE is not None),
             "tick_count": int(LIVE_TICK_COUNT),
             "last_tick_at": LIVE_LAST_TICK_AT,
+            "last_tick_ltp": LIVE_LAST_TICK_LTP,
             "feed_config": LIVE_FEED_CONFIG,
         }
     )
@@ -1412,7 +1437,13 @@ def live_errors(limit: int = 100) -> JSONResponse:
 def live_candles(limit: int = 300) -> JSONResponse:
     if LIVE_ENGINE is None:
         return JSONResponse({"ok": False, "error": "not running"}, status_code=400)
-    return JSONResponse({"ok": True, "candles": LIVE_ENGINE.last_candles(limit=limit)})
+    cur = None
+    try:
+        if LIVE_CANDLE_BUILDER is not None:
+            cur = LIVE_CANDLE_BUILDER.current_snapshot()
+    except Exception:
+        cur = None
+    return JSONResponse({"ok": True, "candles": LIVE_ENGINE.last_candles(limit=limit), "current": cur})
 
 
 @app.get("/api/live/decisions")
