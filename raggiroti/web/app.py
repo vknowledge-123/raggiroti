@@ -38,6 +38,7 @@ from raggiroti.dhan.option_chain import DhanOptionChainClient, summarize_oi_wall
 from raggiroti.live.candle_builder import CandleBuilder1m
 from raggiroti.live.models import Tick
 from raggiroti.live.live_sim_engine import LiveSimEngine
+from raggiroti.predict.next_day_predictor import NextDayPredictor
 from raggiroti.live.models import LiveCandle
 
 
@@ -55,6 +56,19 @@ class BacktestJob:
 
 
 BACKTEST_JOBS: dict[str, BacktestJob] = {}
+
+
+@dataclass
+class PredictJob:
+    id: str
+    status: str  # queued|running|done|error
+    created_at: str
+    updated_at: str
+    result: dict | None = None
+    error: str | None = None
+
+
+PREDICT_JOBS: dict[str, PredictJob] = {}
 
 LIVE_LOCK = threading.Lock()
 LIVE_THREAD: threading.Thread | None = None
@@ -536,6 +550,32 @@ def home() -> str:
     </div>
 
     <div class="card">
+      <h3>Prediction (Next-Day Levels)</h3>
+      <form id="predf">
+        <label>Symbol</label>
+        <input name="symbol" value="NIFTY" />
+        <label>Training start date (YYYY-MM-DD)</label>
+        <input name="training_start_date" placeholder="2026-04-06" required />
+        <label>Target date to predict (YYYY-MM-DD)</label>
+        <input name="target_date" placeholder="2026-04-07" required />
+        <label>Use previous trading day OI snapshot (0/1)</label>
+        <input name="use_prev_day_oi" value="1" />
+        <div style="margin-top:10px;">
+          <button type="button" onclick="oiCapture()">Capture OI snapshot NOW</button>
+          <button type="button" onclick="oiLatest()">Show latest OI snapshot</button>
+        </div>
+        <div style="margin-top:12px;">
+          <button type="button" onclick="predSubmit()">Predict</button>
+          <button type="button" onclick="predGet()">Get result</button>
+        </div>
+        <label>Prediction job id</label>
+        <input id="pred_job_id" placeholder="pr_..." />
+        <p class="muted">Uses previous days (from start to previous trading day) and predicts levels for the target day with Gemini + rulebook + optional OI.</p>
+      </form>
+      <pre id="predout"></pre>
+    </div>
+
+    <div class="card">
       <h3>Rulebook Learning (Transcript -&gt; Proposal -&gt; Approve -&gt; Merge)</h3>
       <div class="row">
         <div>
@@ -798,6 +838,47 @@ def home() -> str:
           document.getElementById('outd').textContent = `Request failed: ${e}`;
         }
       }
+
+      async function predSubmit() {
+        const fd = new FormData(document.getElementById('predf'));
+        const r = await fetch('/api/predict/next_day/submit', { method: 'POST', body: fd });
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) {}
+        document.getElementById('predout').textContent = (j ? JSON.stringify(j, null, 2) : t);
+        if (j && j.job_id) document.getElementById('pred_job_id').value = j.job_id;
+      }
+
+      async function predGet() {
+        const id = document.getElementById('pred_job_id').value;
+        const r = await fetch(`/api/predict/job/${id}`);
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) {}
+        document.getElementById('predout').textContent = (j ? JSON.stringify(j, null, 2) : t);
+      }
+
+      async function oiCapture() {
+        const fd = new FormData(document.getElementById('predf'));
+        const symbol = fd.get('symbol') || 'NIFTY';
+        const form = new FormData();
+        form.set('symbol', symbol.toString());
+        const r = await fetch('/api/oi/snapshot/capture', { method: 'POST', body: form });
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) {}
+        document.getElementById('predout').textContent = (j ? JSON.stringify(j, null, 2) : t);
+      }
+
+      async function oiLatest() {
+        const fd = new FormData(document.getElementById('predf'));
+        const symbol = fd.get('symbol') || 'NIFTY';
+        const r = await fetch(`/api/oi/snapshot/latest?symbol=${encodeURIComponent(symbol.toString())}`);
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) {}
+        document.getElementById('predout').textContent = (j ? JSON.stringify(j, null, 2) : t);
+      }
     </script>
   </body>
 </html>
@@ -923,6 +1004,11 @@ def _fetch_prev_trading_day_candles(*, security_id: str, access_token: str) -> t
         return None
     prev_date = prev_dates[-1]
     return prev_date, sorted(by[prev_date], key=lambda c: c.dt)
+
+
+def _today_ist_date() -> str:
+    ist = ZoneInfo("Asia/Kolkata")
+    return datetime.now(tz=ist).strftime("%Y-%m-%d")
 
 
 def _start_live_thread(
@@ -1658,3 +1744,157 @@ def backtest_job_get(job_id: str) -> JSONResponse:
     if not job:
         return JSONResponse({"ok": False, "error": "job not found"}, status_code=404)
     return JSONResponse({"ok": True, "job": asdict(job)})
+
+
+@app.post("/api/predict/next_day/submit")
+async def predict_next_day_submit(
+    symbol: str = Form(...),
+    training_start_date: str = Form(...),
+    target_date: str = Form(...),
+    use_prev_day_oi: int = Form(1),
+) -> JSONResponse:
+    """
+    Next-day level prediction job.
+    - Uses Dhan historical intraday candles for training window.
+    - Uses Gemini + rulebook (+ optional live OI snapshot) to produce bucketed gap plans.
+    """
+    job_id = f"pr_{uuid.uuid4().hex[:16]}"
+    now = datetime.now(timezone.utc).isoformat()
+    job = PredictJob(id=job_id, status="queued", created_at=now, updated_at=now)
+    PREDICT_JOBS[job_id] = job
+
+    async def _run() -> None:
+        job.status = "running"
+        job.updated_at = datetime.now(timezone.utc).isoformat()
+        settings = get_settings()
+        try:
+            client_id = _get_dhan_client_id_raw(settings.db_path)
+            access_token = _get_dhan_access_token_raw(settings.db_path)
+            if not access_token:
+                raise ValueError("missing dhan access token; save it on home page first")
+            gemini_key = _get_gemini_api_key_raw(settings.db_path)
+            gemini_model = _get_gemini_decision_model_raw(settings.db_path) or "gemini-2.5-flash"
+            if not gemini_key:
+                raise ValueError("missing gemini api key; save it on home page first")
+
+            sec = _security_id_for_symbol(symbol)
+            predictor = NextDayPredictor(
+                api_key=gemini_key,
+                model=gemini_model,
+                db_path=settings.db_path,
+                rulebook_path=settings.rulebook_path,
+            )
+            out = predictor.predict_next_day(
+                instrument=str(symbol).upper().strip(),
+                security_id=sec,
+                exchange_segment="IDX_I",
+                training_start_date=training_start_date,
+                target_date=target_date,
+                dhan_client_id=client_id,
+                dhan_access_token=access_token,
+                use_prev_day_oi_snapshot=bool(int(use_prev_day_oi)),
+            )
+            job.result = {
+                "ok": True,
+                "instrument": out.instrument,
+                "security_id": out.security_id,
+                "target_date": out.target_date,
+                "training_start_date": out.training_start_date,
+                "training_end_date": out.training_end_date,
+                "prev_date_used": out.prev_date_used,
+                "prev_levels": out.prev_levels,
+                "stats": out.stats,
+                "oi": out.oi,
+                "retrieved_rules": out.retrieved_rules,
+                "prediction": out.prediction,
+            }
+            job.status = "done"
+        except Exception as e:
+            job.status = "error"
+            job.error = str(e)
+        finally:
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+
+    asyncio.create_task(_run())
+    return JSONResponse({"ok": True, "job_id": job_id})
+
+
+@app.get("/api/predict/job/{job_id}")
+def predict_job_get(job_id: str) -> JSONResponse:
+    job = PREDICT_JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"ok": False, "error": "job not found"}, status_code=404)
+    return JSONResponse({"ok": True, "job": asdict(job)})
+
+
+@app.post("/api/oi/snapshot/capture")
+def oi_snapshot_capture(symbol: str = Form(...)) -> JSONResponse:
+    """
+    Capture option-chain OI snapshot NOW (from Dhan), store it in SQLite tagged to today's IST date.
+    This enables "historical OI" usage for next-day prediction before market open.
+    """
+    settings = get_settings()
+    client_id = _get_dhan_client_id_raw(settings.db_path)
+    access_token = _get_dhan_access_token_raw(settings.db_path)
+    if not client_id or not access_token:
+        return JSONResponse({"ok": False, "error": "missing dhan settings"}, status_code=400)
+
+    sym = str(symbol).upper().strip()
+    sec = _security_id_for_symbol(sym)
+    ex_seg = "IDX_I"
+    try:
+        oc = DhanOptionChainClient(client_id=client_id, access_token=access_token)
+        exp = oc.expiry_list(under_security_id=int(sec), under_exchange_segment=ex_seg)
+        exp_list = exp.get("data") or exp.get("Data") or exp.get("expiryList") or exp.get("expiry_list") or []
+        expiry = str(exp_list[0]) if isinstance(exp_list, list) and exp_list else None
+        if not expiry:
+            return JSONResponse({"ok": False, "error": "no expiry returned by dhan"}, status_code=400)
+        chain = oc.option_chain(under_security_id=int(sec), under_exchange_segment=ex_seg, expiry=expiry)
+        summary = summarize_oi_walls(chain, top_n=5)
+        if not summary.get("ok"):
+            return JSONResponse({"ok": False, "error": "option_chain summarize failed", "raw": summary}, status_code=400)
+
+        store = SqliteStore(settings.db_path)
+        now = datetime.now(timezone.utc).isoformat()
+        date_ist = _today_ist_date()
+        snap_id = f"oi_{sec}_{date_ist}_{uuid.uuid4().hex[:8]}"
+        store.add_oi_snapshot(
+            snapshot_id=snap_id,
+            captured_at=now,
+            date=date_ist,
+            symbol=sym,
+            security_id=str(sec),
+            exchange_segment=ex_seg,
+            expiry=expiry,
+            snapshot=summary,
+        )
+        store.close()
+        return JSONResponse({"ok": True, "id": snap_id, "date": date_ist, "symbol": sym, "security_id": sec, "expiry": expiry, "snapshot": summary})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/oi/snapshot/latest")
+def oi_snapshot_latest(symbol: str) -> JSONResponse:
+    settings = get_settings()
+    sym = str(symbol).upper().strip()
+    sec = _security_id_for_symbol(sym)
+    date_ist = _today_ist_date()
+    store = SqliteStore(settings.db_path)
+    row = store.get_latest_oi_snapshot(date=date_ist, security_id=str(sec))
+    store.close()
+    if not row:
+        return JSONResponse({"ok": False, "error": "no snapshot found for today (capture first)", "date": date_ist, "symbol": sym, "security_id": sec}, status_code=404)
+    return JSONResponse({"ok": True, "row": row})
+
+
+@app.get("/api/oi/snapshot/list")
+def oi_snapshot_list(symbol: str | None = None, date: str | None = None, limit: int = 20) -> JSONResponse:
+    settings = get_settings()
+    sec = None
+    if symbol:
+        sec = _security_id_for_symbol(str(symbol))
+    store = SqliteStore(settings.db_path)
+    rows = store.list_oi_snapshots(security_id=None if sec is None else str(sec), date=date, limit=int(limit))
+    store.close()
+    return JSONResponse({"ok": True, "rows": rows})

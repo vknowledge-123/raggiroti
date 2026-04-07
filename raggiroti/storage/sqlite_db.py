@@ -53,6 +53,21 @@ CREATE TABLE IF NOT EXISTS rulebook_index (
   tags_json TEXT,
   PRIMARY KEY(rulebook_version, rule_id)
 );
+
+-- Option chain / OI snapshots captured from Dhan (stored for "historical" usage).
+-- Dhan option chain API is typically a live snapshot; to use it for next-day prediction
+-- (before market open), we capture and persist the last trading day's snapshot.
+CREATE TABLE IF NOT EXISTS oi_snapshots (
+  id TEXT PRIMARY KEY,
+  captured_at TEXT NOT NULL,
+  date TEXT NOT NULL, -- YYYY-MM-DD (Asia/Kolkata trading day)
+  symbol TEXT NOT NULL, -- NIFTY|BANKNIFTY
+  security_id TEXT NOT NULL, -- 13|25
+  exchange_segment TEXT NOT NULL, -- IDX_I
+  expiry TEXT,
+  snapshot_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oi_snapshots_date_sec ON oi_snapshots(date, security_id);
 """
 
 
@@ -250,3 +265,80 @@ class SqliteStore:
             (cache_id, created_at, model, request_hash, json.dumps(response, ensure_ascii=False)),
         )
         self._conn.commit()
+
+    # ---------------- OI snapshots (option chain) ----------------
+
+    def add_oi_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        captured_at: str,
+        date: str,
+        symbol: str,
+        security_id: str,
+        exchange_segment: str,
+        expiry: str | None,
+        snapshot: dict,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO oi_snapshots(id, captured_at, date, symbol, security_id, exchange_segment, expiry, snapshot_json) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                snapshot_id,
+                captured_at,
+                date,
+                symbol,
+                security_id,
+                exchange_segment,
+                expiry,
+                json.dumps(snapshot, ensure_ascii=False),
+            ),
+        )
+        self._conn.commit()
+
+    def get_latest_oi_snapshot(self, *, date: str, security_id: str) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT id, captured_at, date, symbol, security_id, exchange_segment, expiry, snapshot_json "
+            "FROM oi_snapshots WHERE date=? AND security_id=? ORDER BY captured_at DESC LIMIT 1",
+            (date, str(security_id)),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "captured_at": row[1],
+            "date": row[2],
+            "symbol": row[3],
+            "security_id": row[4],
+            "exchange_segment": row[5],
+            "expiry": row[6],
+            "snapshot": json.loads(row[7]),
+        }
+
+    def list_oi_snapshots(self, *, security_id: str | None = None, date: str | None = None, limit: int = 50) -> list[dict]:
+        q = (
+            "SELECT id, captured_at, date, symbol, security_id, exchange_segment, expiry "
+            "FROM oi_snapshots WHERE 1=1"
+        )
+        args: list[object] = []
+        if security_id:
+            q += " AND security_id=?"
+            args.append(str(security_id))
+        if date:
+            q += " AND date=?"
+            args.append(str(date))
+        q += " ORDER BY captured_at DESC LIMIT ?"
+        args.append(int(limit))
+        cur = self._conn.execute(q, tuple(args))
+        return [
+            {
+                "id": r[0],
+                "captured_at": r[1],
+                "date": r[2],
+                "symbol": r[3],
+                "security_id": r[4],
+                "exchange_segment": r[5],
+                "expiry": r[6],
+            }
+            for r in cur.fetchall()
+        ]
