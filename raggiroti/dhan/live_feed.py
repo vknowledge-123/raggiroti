@@ -54,8 +54,19 @@ class DhanLiveFeed:
 
         # Prefer stable marketfeed module.
         try:
+            # Ensure an event loop exists for libraries that call asyncio.get_event_loop().
+            try:
+                import asyncio as _asyncio
+
+                try:
+                    _asyncio.get_event_loop()
+                except RuntimeError:
+                    _asyncio.set_event_loop(_asyncio.new_event_loop())
+            except Exception:
+                pass
+
             from dhanhq import marketfeed  # type: ignore
-            self._feed = marketfeed.DhanFeed(client_id, access_token, self._instruments, "v2")
+            self._feed = marketfeed.DhanFeed(client_id, access_token, self._instruments, version="v2")
             self._mode = "marketfeed"
             return
         except Exception as e:

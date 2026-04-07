@@ -858,6 +858,18 @@ def _start_live_thread(
     LIVE_CANDLE_BUILDER = CandleBuilder1m()
 
     def _run() -> None:
+        # DhanHQ marketfeed uses asyncio internally. In Python 3.11, non-main threads do not
+        # have a default event loop, so we must create one explicitly.
+        try:
+            import asyncio as _asyncio
+
+            try:
+                _asyncio.get_event_loop()
+            except RuntimeError:
+                _asyncio.set_event_loop(_asyncio.new_event_loop())
+        except Exception:
+            pass
+
         # NOTE: use Quote or Full to get volume (Full typically contains more fields).
         # DhanHQ-py (stable 2.0.2) provides constants in `dhanhq.marketfeed`.
         try:
