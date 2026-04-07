@@ -705,8 +705,10 @@ class NextDayPredictor:
                 "temperature": 0,
                 "maxOutputTokens": 4096,
                 "responseMimeType": "application/json",
-                # Use JSON Schema structured outputs for reliable JSON.
-                "responseJsonSchema": schema,
+                # Gemini API supports JSON Schema via the special `_responseJsonSchema` field.
+                # Using `responseJsonSchema` has been observed to be ignored in some deployments (internal-detail field),
+                # leading to schema not being enforced and single-bucket outputs.
+                "_responseJsonSchema": schema,
             },
         }
 
@@ -832,8 +834,9 @@ class NextDayPredictor:
             with httpx.Client(timeout=self.timeout_s) as client:
                 for attempt in range(1, int(self.max_retries) + 1):
                     r = client.post(url, headers=headers, json=body)
-                    if r.status_code >= 400 and "responseJsonSchema" in body["generationConfig"]:
+                    if r.status_code >= 400 and ("_responseJsonSchema" in body["generationConfig"] or "responseJsonSchema" in body["generationConfig"]):
                         # Older deployments may not support schemas. Drop and retry.
+                        body["generationConfig"].pop("_responseJsonSchema", None)
                         body["generationConfig"].pop("responseJsonSchema", None)
                         schema_dropped = True
                         r = client.post(url, headers=headers, json=body)
@@ -895,11 +898,12 @@ class NextDayPredictor:
                         "temperature": 0,
                         "maxOutputTokens": 4096,
                         "responseMimeType": "application/json",
-                        "responseJsonSchema": schema,
+                        "_responseJsonSchema": schema,
                     },
                 }
                 r3 = client.post(url, headers=headers, json=body_repair)
-                if r3.status_code >= 400 and "responseJsonSchema" in body_repair["generationConfig"]:
+                if r3.status_code >= 400 and ("_responseJsonSchema" in body_repair["generationConfig"] or "responseJsonSchema" in body_repair["generationConfig"]):
+                    body_repair["generationConfig"].pop("_responseJsonSchema", None)
                     body_repair["generationConfig"].pop("responseJsonSchema", None)
                     r3 = client.post(url, headers=headers, json=body_repair)
                 r3.raise_for_status()
