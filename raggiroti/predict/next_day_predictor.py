@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import time
 
 import httpx
 
@@ -25,7 +27,27 @@ def _extract_json(text: str) -> dict:
     text = (text or "").strip()
     if not text:
         raise ValueError("empty response")
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise
+        return json.loads(m.group(0))
+
+
+def _extract_candidate_text(data: dict) -> str:
+    try:
+        cand = (data.get("candidates") or [{}])[0] or {}
+        content = cand.get("content") or {}
+        parts = content.get("parts") or []
+        texts: list[str] = []
+        for p in parts:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                texts.append(p["text"])
+        return "\n".join(texts).strip()
+    except Exception:
+        return ""
 
 
 def _normalize_model_id(model: str) -> str:
@@ -72,6 +94,8 @@ class NextDayPredictor:
     rulebook_path: str
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout_s: float = 25.0
+    max_retries: int = 3
+    retry_backoff_s: float = 0.8
 
     def predict_next_day(
         self,
@@ -251,7 +275,7 @@ class NextDayPredictor:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "summary": {"type": "string"},
+                "summary_points": {"type": "array", "items": {"type": "string"}},
                 "base_levels": {
                     "type": "object",
                     "additionalProperties": False,
@@ -271,7 +295,7 @@ class NextDayPredictor:
                     "properties": {k["key"]: {"type": "object"} for k in gap_buckets},
                 },
             },
-            "required": ["summary", "base_levels", "gap_plans"],
+            "required": ["summary_points", "base_levels", "gap_plans"],
         }
 
         sys = (
@@ -279,6 +303,7 @@ class NextDayPredictor:
             "Use ONLY the provided historical context, OI snapshot (if present), and retrieved rulebook rules. "
             "For each gap bucket, output actionable levels (operator zones, liquidity pools) and a one-sided bias for that bucket. "
             "Be conservative: if unsure for a bucket, set its plan to WAIT and explain briefly. "
+            "All strings must be SINGLE-LINE (no raw newlines). If needed, use '\\n' inside strings. "
             "Output STRICT JSON only. No markdown."
         )
 
@@ -294,31 +319,61 @@ class NextDayPredictor:
 
         url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
         params = {"key": self.api_key}
-        try:
-            with httpx.Client(timeout=self.timeout_s) as client:
-                r = client.post(url, params=params, json=body)
-                if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
-                    body["generationConfig"].pop("responseSchema", None)
+        data: dict | None = None
+        last_err: str | None = None
+        with httpx.Client(timeout=self.timeout_s) as client:
+            for attempt in range(1, int(self.max_retries) + 1):
+                try:
                     r = client.post(url, params=params, json=body)
-                r.raise_for_status()
-                data = r.json()
-        except Exception as e:
+                    if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
+                        body["generationConfig"].pop("responseSchema", None)
+                        r = client.post(url, params=params, json=body)
+                    try:
+                        r.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        status = getattr(getattr(e, "response", None), "status_code", None)
+                        if status in (429, 500, 502, 503, 504) and attempt < int(self.max_retries):
+                            last_err = _sanitize_error(str(e))
+                            time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                            continue
+                        raise
+                    data = r.json()
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = _sanitize_error(str(e))
+                    break
+
+        if data is None:
             store.close()
-            raise RuntimeError(f"gemini_error: {_sanitize_error(str(e))}") from e
+            raise RuntimeError(f"gemini_error: {last_err or 'unknown_error'}")
 
         # Parse response
         try:
-            cand = (data.get("candidates") or [{}])[0] or {}
-            content = cand.get("content") or {}
-            parts = content.get("parts") or []
-            text = ""
-            for p in parts:
-                if isinstance(p, dict) and isinstance(p.get("text"), str):
-                    text += p["text"]
+            text = _extract_candidate_text(data)
             out = _extract_json(text)
         except Exception as e:
-            store.close()
-            raise RuntimeError(f"gemini_parse_error: {_sanitize_error(str(e))}") from e
+            # One parse retry: ask again with no schema and tighter token limit.
+            try:
+                body2 = {
+                    "contents": body["contents"],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "maxOutputTokens": 900,
+                        "responseMimeType": "application/json",
+                    },
+                }
+                with httpx.Client(timeout=self.timeout_s) as client:
+                    r2 = client.post(url, params=params, json=body2)
+                    r2.raise_for_status()
+                    data2 = r2.json()
+                text2 = _extract_candidate_text(data2)
+                out = _extract_json(text2)
+            except Exception as e2:
+                store.close()
+                raise RuntimeError(
+                    f"gemini_parse_error: {_sanitize_error(str(e))} / retry_failed: {_sanitize_error(str(e2))}"
+                ) from e2
 
         cache_id = f"pred_{req_hash[:16]}"
         store.set_llm_cache(cache_id, datetime.now(timezone.utc).isoformat(), self.model, req_hash, out)

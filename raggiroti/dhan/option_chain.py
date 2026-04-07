@@ -112,6 +112,31 @@ def summarize_oi_walls(option_chain_resp: dict, top_n: int = 5) -> dict:
     }
 
 
+def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
+    """
+    Accepts:
+    - Our compact wall summary format: {"ok":true,"ce_walls":[...],"pe_walls":[...]}
+    - Dhan option chain format (handled by summarize_oi_walls)
+    - NSE option chain JSON (common keys: records.data[*].CE/PE)
+    Returns our compact summary format.
+    """
+    if isinstance(payload, dict) and payload.get("ok") is True and isinstance(payload.get("ce_walls"), list) and isinstance(payload.get("pe_walls"), list):
+        return payload
+
+    # NSE option chain API style: {"records":{"data":[{"strikePrice":...,"CE":{...},"PE":{...}}, ...]}}
+    try:
+        rec = payload.get("records") if isinstance(payload, dict) else None
+        data = None
+        if isinstance(rec, dict):
+            data = rec.get("data")
+        if isinstance(data, list):
+            return summarize_oi_walls({"data": data}, top_n=top_n)
+    except Exception:
+        pass
+
+    return summarize_oi_walls(payload, top_n=top_n)
+
+
 def derive_oi_features(*, spot_price: float | None, snapshot: dict | None) -> dict:
     """
     Best-effort derived features from a compact OI snapshot.
