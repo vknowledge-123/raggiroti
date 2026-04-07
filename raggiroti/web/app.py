@@ -688,7 +688,7 @@ def home() -> str:
         <label>Symbol</label>
         <input name="symbol" value="NIFTY" />
         <label>Feed mode (auto|ticker|quote|full)</label>
-        <input name="feed_mode" value="auto" />
+        <input name="feed_mode" value="full" />
         <label>Quantity</label>
         <input name="qty" type="number" value="65" />
         <label>Seed previous trading day (Dhan)</label>
@@ -1289,8 +1289,8 @@ def _start_live_thread(
                 elif mode == "ticker":
                     sub_type = marketfeed.Ticker
                 else:
-                    # default for index: ticker (most reliable)
-                    sub_type = marketfeed.Ticker
+                    # default for index: Full (user wants volume/extra fields when available)
+                    sub_type = marketfeed.Full
             else:
                 exch = marketfeed.NSE
                 if mode == "ticker":
@@ -1305,7 +1305,7 @@ def _start_live_thread(
             exch = 0 if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"} else 1
             mode = (feed_mode or "auto").strip().lower()
             if exch == 0:
-                sub_type = 21 if mode == "full" else (17 if mode == "quote" else 15)
+                sub_type = 21 if mode in {"auto", "full"} else (17 if mode == "quote" else 15)
             else:
                 sub_type = 21 if mode in {"auto", "full"} else (17 if mode == "quote" else 15)
         try:
@@ -1516,7 +1516,7 @@ def live_start(
     symbol: str = Form(...),
     qty: int = Form(65),
     seed_prev_day: int = Form(1),
-    feed_mode: str = Form("auto"),
+    feed_mode: str = Form("full"),
 ) -> JSONResponse:
     """
     Starts live paper-trading loop:

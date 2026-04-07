@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -76,7 +76,16 @@ class LiveSimEngine:
         return self._last_state
 
     def fills(self) -> list[dict]:
-        return list(self._broker.fills)
+        out: list[dict] = []
+        for f in self._broker.fills:
+            try:
+                out.append(asdict(f))
+            except Exception:
+                try:
+                    out.append(dict(getattr(f, "__dict__", {}) or {}))
+                except Exception:
+                    out.append({"type": type(f).__name__})
+        return out
 
     def reset(self) -> None:
         self._broker = BrokerSim()

@@ -150,7 +150,30 @@ def parse_marketfeed_tick(msg: dict) -> tuple[str, float, float | None, datetime
             raise ValueError(f"non_ltp_packet:{data.get('type') or ''}")
         raise ValueError(f"missing ltp in tick: keys={list(data.keys())[:12]}")
 
-    vol = _pick(data, ["volume", "Volume", "total_volume", "TotalVolume", "totalVolume"])
+    # Volume field names vary a lot across segments/subscription types.
+    # We treat it as cumulative volume and let CandleBuilder1m take differences.
+    vol = _pick(
+        data,
+        [
+            "volume",
+            "Volume",
+            "VOLUME",
+            "total_volume",
+            "TotalVolume",
+            "totalVolume",
+            "total_traded_volume",
+            "TotalTradedVolume",
+            "totalTradedVolume",
+            "total_traded_quantity",
+            "TotalTradedQuantity",
+            "ttq",
+            "TTQ",
+            "tv",
+            "TV",
+            "ttv",
+            "TTV",
+        ],
+    )
 
     # Some feeds include exchange time; if not, use now.
     dt = _now_dt()
