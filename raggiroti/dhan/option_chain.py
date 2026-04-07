@@ -87,7 +87,27 @@ def summarize_oi_walls(option_chain_resp: dict, top_n: int = 5) -> dict:
     Converts the full option chain payload into a compact OI "wall" summary.
     Assumes response contains strike rows with CE/PE legs (common in Dhan).
     """
-    rows = option_chain_resp.get("data") or option_chain_resp.get("Data") or option_chain_resp.get("option_data") or option_chain_resp.get("optionData")
+    def _coerce_rows(obj: object) -> list[dict] | None:
+        if isinstance(obj, list):
+            # keep dict rows only
+            rows0 = [x for x in obj if isinstance(x, dict)]
+            return rows0 if rows0 else None
+        if isinstance(obj, dict):
+            # common keys
+            for k in ("data", "Data", "option_data", "optionData", "records", "result", "payload"):
+                if k in obj:
+                    out = _coerce_rows(obj.get(k))
+                    if out is not None:
+                        return out
+            # NSE records.data style
+            rec = obj.get("records")
+            if isinstance(rec, dict) and "data" in rec:
+                out = _coerce_rows(rec.get("data"))
+                if out is not None:
+                    return out
+        return None
+
+    rows = _coerce_rows(option_chain_resp)
     if not isinstance(rows, list):
         return {"ok": False, "error": "unexpected option_chain format", "raw_keys": list(option_chain_resp.keys())[:20]}
 
@@ -176,18 +196,39 @@ def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
             return True
         return False
 
+    def _looks_like_leg_dict(v: object) -> bool:
+        if not isinstance(v, dict):
+            return False
+        # Common OI keys across vendors.
+        for k in ("oi", "openInterest", "open_interest", "OI"):
+            if k in v and v.get(k) is not None:
+                return True
+        # Sometimes only change-in-OI is present.
+        for k in ("oiChange", "changeinOpenInterest", "change_in_oi", "oi_change"):
+            if k in v and v.get(k) is not None:
+                return True
+        return False
+
     def _looks_like_option_row(x: object) -> bool:
         if not isinstance(x, dict):
             return False
         if not _looks_like_strike_row(x):
             return False
         # Common legs
-        if isinstance(x.get("CE"), dict) or isinstance(x.get("PE"), dict):
+        if _looks_like_leg_dict(x.get("CE")) or _looks_like_leg_dict(x.get("PE")):
             return True
-        if isinstance(x.get("ce"), dict) or isinstance(x.get("pe"), dict):
+        if _looks_like_leg_dict(x.get("ce")) or _looks_like_leg_dict(x.get("pe")):
             return True
-        if isinstance(x.get("call"), dict) or isinstance(x.get("put"), dict):
+        if _looks_like_leg_dict(x.get("call")) or _looks_like_leg_dict(x.get("put")):
             return True
+        if _looks_like_leg_dict(x.get("CALL")) or _looks_like_leg_dict(x.get("PUT")):
+            return True
+        if _looks_like_leg_dict(x.get("Call")) or _looks_like_leg_dict(x.get("Put")):
+            return True
+        # Generic: any nested dict looks like a leg.
+        for v in x.values():
+            if _looks_like_leg_dict(v):
+                return True
         return False
 
     def _find_option_rows(obj: object, max_nodes: int = 2000) -> list[dict] | None:

@@ -159,6 +159,28 @@ def _compact_tick_msg(msg: object) -> dict:
     return out
 
 
+def _compact_oi_payload(obj: object) -> dict:
+    """
+    Compact a potentially large option-chain/expiry payload for debugging.
+    Avoids returning the entire chain.
+    """
+    if not isinstance(obj, dict):
+        return {"type": type(obj).__name__}
+    out: dict = {"keys": list(obj.keys())[:30]}
+    if "status" in obj:
+        out["status"] = obj.get("status")
+    if "remarks" in obj:
+        out["remarks"] = obj.get("remarks")
+    data = obj.get("data") if "data" in obj else obj.get("Data")
+    if isinstance(data, dict):
+        out["data_keys"] = list(data.keys())[:40]
+    elif isinstance(data, list):
+        out["data_len"] = len(data)
+        if data and isinstance(data[0], dict):
+            out["row0_keys"] = list(data[0].keys())[:40]
+    return out
+
+
 def _extract_list_any(obj: object, keys: list[str]) -> list[str]:
     """
     Extract a list[str] from a variety of vendor payload shapes:
@@ -1394,7 +1416,7 @@ def _start_live_thread(
 
     # Optional: OI polling (option chain). Runs independently of tick feed.
     def _run_oi() -> None:
-        global LIVE_OI_SNAPSHOT, LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
+        global LIVE_OI_SNAPSHOT, LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR, LIVE_OI_DEBUG
         try:
             oc = DhanOptionChainClient(client_id=client_id, access_token=access_token)
         except Exception as e:
@@ -1410,6 +1432,11 @@ def _start_live_thread(
                 # If expiry missing, keep retrying instead of stopping the OI thread forever.
                 if not expiry:
                     exp = oc.expiry_list(under_security_id=int(security_id), under_exchange_segment=ex_seg)
+                    with LIVE_OI_DEBUG_LOCK:
+                        LIVE_OI_DEBUG = {
+                            "dt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "expiry_list": _compact_oi_payload(exp),
+                        }
                     exp_list = _extract_list_any(exp, ["data", "Data", "expiryList", "expiry_list", "expiries", "expiry"])
                     if exp_list:
                         expiry = str(exp_list[0])
@@ -1425,6 +1452,22 @@ def _start_live_thread(
                         continue
 
                 chain = oc.option_chain(under_security_id=int(security_id), under_exchange_segment=ex_seg, expiry=expiry)
+                with LIVE_OI_DEBUG_LOCK:
+                    prev = LIVE_OI_DEBUG if isinstance(LIVE_OI_DEBUG, dict) else {}
+                    LIVE_OI_DEBUG = {
+                        **prev,
+                        "dt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "option_chain": _compact_oi_payload(chain),
+                        "expiry_used": expiry,
+                    }
+
+                # dhanhq wrapper failure: surface remarks instead of "unexpected format"
+                if isinstance(chain, dict) and chain.get("status") == "failure":
+                    LIVE_OI_LAST_ERROR = f"option_chain_failure:{chain.get('remarks')}"
+                    _push_live_error("oi_error", {"where": "option_chain", "error": LIVE_OI_LAST_ERROR})
+                    time.sleep(30)
+                    continue
+
                 # Use the robust parser that supports dhanhq wrapper responses.
                 summary = summarize_oi_walls_any(chain, top_n=5)
                 if summary.get("ok"):
@@ -1435,11 +1478,7 @@ def _start_live_thread(
                         LIVE_ENGINE.set_oi_snapshot(summary)
                 else:
                     LIVE_OI_LAST_ERROR = str(summary.get("error") or "oi_summary_failed")
-                    try:
-                        raw_keys = list(chain.keys())[:20] if isinstance(chain, dict) else []
-                    except Exception:
-                        raw_keys = []
-                    _push_live_error("oi_error", {"where": "option_chain_parse", "error": LIVE_OI_LAST_ERROR, "raw_keys": raw_keys})
+                    _push_live_error("oi_error", {"where": "option_chain_parse", "error": LIVE_OI_LAST_ERROR, "summary": summary})
             except Exception:
                 try:
                     LIVE_OI_LAST_ERROR = "oi_option_chain_exception"
@@ -1686,6 +1725,13 @@ def live_debug_ticks(limit: int = 50) -> JSONResponse:
     with LIVE_TICK_DEBUG_LOCK:
         items = list(LIVE_TICK_DEBUG[-lim:])
     return JSONResponse({"ok": True, "count": len(items), "ticks": items})
+
+
+@app.get("/api/live/debug/oi")
+def live_debug_oi() -> JSONResponse:
+    with LIVE_OI_DEBUG_LOCK:
+        dbg = LIVE_OI_DEBUG
+    return JSONResponse({"ok": True, "debug": dbg})
 
 
 @app.get("/api/live/candles")
