@@ -44,6 +44,10 @@ class CandleBuilder1m:
             self.l = tick.ltp if self.l is None else min(self.l, tick.ltp)
             self.c = tick.ltp
             if tick.volume is not None:
+                # If the stream initially lacked volume (e.g., fallback ticker), but later
+                # provides it (e.g., full packet), initialize vol0 from the first seen value.
+                if self.vol0 is None:
+                    self.vol0 = tick.volume
                 self.vol_last = tick.volume
             return None
 

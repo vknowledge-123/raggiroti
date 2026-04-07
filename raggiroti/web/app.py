@@ -1271,6 +1271,7 @@ def _start_live_thread(
 
         # NOTE: use Quote or Full to get volume (Full typically contains more fields).
         # DhanHQ-py (stable 2.0.2) provides constants in `dhanhq.marketfeed`.
+        sub_types: list[int] = []
         try:
             from dhanhq import marketfeed  # type: ignore
             # Indices (NIFTY/BANKNIFTY) are on the IDX exchange segment in Dhan MarketFeed.
@@ -1299,6 +1300,7 @@ def _start_live_thread(
                     sub_type = marketfeed.Quote
                 else:
                     sub_type = marketfeed.Full
+            sub_types = [int(sub_type)]
         except Exception:
             # Fallback defaults (may be wrong for some segments).
             sym0 = (symbol or "").upper().strip()
@@ -1308,18 +1310,35 @@ def _start_live_thread(
                 sub_type = 21 if mode in {"auto", "full"} else (17 if mode == "quote" else 15)
             else:
                 sub_type = 21 if mode in {"auto", "full"} else (17 if mode == "quote" else 15)
+            sub_types = [int(sub_type)]
         try:
             global LIVE_FEED_CONFIG
-            LIVE_FEED_CONFIG = {"exchange_segment": int(exch), "subscription_type": int(sub_type), "feed_mode": (feed_mode or "auto")}
+            LIVE_FEED_CONFIG = {"exchange_segment": int(exch), "subscription_type": int(sub_type), "subscription_types": sub_types, "feed_mode": (feed_mode or "auto")}
         except Exception:
             pass
 
         feed = None
         try:
+            instruments = [LiveFeedInstrument(exchange_segment=int(exch), security_id=security_id, subscription_type=int(sub_type))]
+            # Some Dhan accounts/segments do not emit LTP ticks on Full for indices.
+            # Subscribe to Ticker in parallel to guarantee candles still form.
+            try:
+                if int(exch) == 0 and int(sub_type) == 21:
+                    from dhanhq import marketfeed  # type: ignore
+
+                    instruments.append(LiveFeedInstrument(exchange_segment=int(exch), security_id=security_id, subscription_type=int(marketfeed.Ticker)))
+                    sub_types2 = [int(sub_type), int(marketfeed.Ticker)]
+                    try:
+                        LIVE_FEED_CONFIG = {**(LIVE_FEED_CONFIG or {}), "subscription_types": sub_types2}
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             feed = DhanLiveFeed(
                 client_id=client_id,
                 access_token=access_token,
-                instruments=[LiveFeedInstrument(exchange_segment=int(exch), security_id=security_id, subscription_type=int(sub_type))],
+                instruments=instruments,
             )
             with LIVE_LOCK:
                 LIVE_FEED = feed
