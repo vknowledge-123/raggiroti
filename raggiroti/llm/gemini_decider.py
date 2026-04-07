@@ -107,9 +107,9 @@ class GeminiDecider:
     model: str
     db_path: str
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    timeout_s: float = 15.0
-    max_retries: int = 3
-    retry_backoff_s: float = 0.6
+    timeout_s: float = 30.0
+    max_retries: int = 4
+    retry_backoff_s: float = 0.8
 
     def decide(self, state: dict, retrieved: dict) -> dict:
         payload = {"state": state, "retrieved": retrieved, "schema_version": 1}
