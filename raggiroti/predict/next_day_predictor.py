@@ -1150,7 +1150,13 @@ class NextDayPredictor:
 
             # If Gemini returned a single-bucket legacy output, merge it into full-bucket fallback.
             if _looks_like_single_bucket_output(out):
-                out = _merge_single_bucket_into_fallback(out, _fallback_prediction("single_bucket_output"), expected_keys)
+                # Prefer bucket-level planning (11 small calls) over merging a single bucket,
+                # because the user expects ALL regimes to be Gemini-driven whenever possible.
+                out_bucket = _bucket_level_plans(client, "single_bucket_output")
+                if isinstance(out_bucket, dict) and out_bucket.get("_fallback") is not True:
+                    out = out_bucket
+                else:
+                    out = _merge_single_bucket_into_fallback(out, _fallback_prediction("single_bucket_output"), expected_keys)
 
             # Validate shape; if Gemini returned a single bucket or wrong schema, try one repair call.
             bad = _validate_full_prediction_shape(out, expected_keys)
@@ -1213,25 +1219,35 @@ class NextDayPredictor:
                         "responseMimeType": "application/json",
                     },
                 }
-                with httpx.Client(timeout=self.timeout_s) as client:
-                    r2 = client.post(url, headers=headers, json=body2)
+                # Keep the client open so we can immediately fall back to bucket-level planning
+                # without accidentally using a closed httpx client.
+                with httpx.Client(timeout=self.timeout_s) as client2:
+                    r2 = client2.post(url, headers=headers, json=body2)
                     r2.raise_for_status()
                     data2 = r2.json()
-                text2 = _extract_candidate_text(data2)
-                out = _extract_json(text2)
-                out = _coerce_prediction_shape(out if isinstance(out, dict) else {})
-                if _looks_like_single_bucket_output(out):
-                    out = _merge_single_bucket_into_fallback(out, _fallback_prediction("single_bucket_output_no_schema"), expected_keys)
-                bad2 = _validate_full_prediction_shape(out, expected_keys)
-                if bad2 is not None:
-                    # Try partial merge first; if still invalid, go bucket-by-bucket to guarantee full regime output.
-                    merged2 = _merge_partial_prediction_into_fallback(out, _fallback_prediction(f"partial_merge_no_schema:{bad2}"), expected_keys)
-                    bad2m = _validate_full_prediction_shape(merged2, expected_keys)
-                    if bad2m is None:
-                        out = merged2
-                    else:
-                        out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad2}" )
-                last_err = None
+                    text2 = _extract_candidate_text(data2)
+                    out = _extract_json(text2)
+                    out = _coerce_prediction_shape(out if isinstance(out, dict) else {})
+
+                    if _looks_like_single_bucket_output(out):
+                        out_bucket = _bucket_level_plans(client2, "single_bucket_output_no_schema")
+                        if isinstance(out_bucket, dict) and out_bucket.get("_fallback") is not True:
+                            out = out_bucket
+                        else:
+                            out = _merge_single_bucket_into_fallback(out, _fallback_prediction("single_bucket_output_no_schema"), expected_keys)
+
+                    bad2 = _validate_full_prediction_shape(out, expected_keys)
+                    if bad2 is not None:
+                        # Try partial merge first; if still invalid, go bucket-by-bucket to guarantee full regime output.
+                        merged2 = _merge_partial_prediction_into_fallback(
+                            out, _fallback_prediction(f"partial_merge_no_schema:{bad2}"), expected_keys
+                        )
+                        bad2m = _validate_full_prediction_shape(merged2, expected_keys)
+                        if bad2m is None:
+                            out = merged2
+                        else:
+                            out = _bucket_level_plans(client2, f"gemini_invalid_shape:{bad2}")
+                    last_err = None
             except Exception as e2:
                 last_err = f"{last_err} / retry_failed: {_sanitize_error(str(e2))}"
                 out = _fallback_prediction(last_err)
