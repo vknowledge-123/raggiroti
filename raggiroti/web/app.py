@@ -465,6 +465,7 @@ def home() -> str:
       </form>
       <div style="margin-top:10px;">
         <button onclick="loadGemini()">Show saved Gemini settings</button>
+        <button onclick="listGeminiModels()">List available models</button>
         <pre id="gemini"></pre>
       </div>
     </div>
@@ -571,6 +572,13 @@ def home() -> str:
         const r = await fetch('/api/settings/gemini');
         const j = await r.json();
         document.getElementById('gemini').textContent = JSON.stringify(j, null, 2);
+      }
+      async function listGeminiModels() {
+        const r = await fetch('/api/gemini/models');
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch (e) {}
+        document.getElementById('gemini').textContent = (j ? JSON.stringify(j, null, 2) : t);
       }
       async function loadLLM() {
         const r = await fetch('/api/llm/status');
@@ -791,6 +799,38 @@ def set_gemini_settings(
         extract_model = decision_model
     _set_gemini_settings(settings.db_path, api_key=api_key, decision_model=decision_model, extract_model=extract_model)
     return JSONResponse({"ok": True})
+
+
+@app.get("/api/gemini/models")
+def gemini_list_models() -> JSONResponse:
+    """
+    Debug helper for 404 issues:
+    returns the models visible to the configured Gemini API key.
+    """
+    settings = get_settings()
+    api_key = _get_gemini_api_key_raw(settings.db_path)
+    if not api_key:
+        return JSONResponse({"ok": False, "error": "missing gemini api key"}, status_code=400)
+    # Call list models endpoint
+    import httpx
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(url, params={"key": api_key})
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        # sanitize key in any error string
+        msg = str(e).replace(api_key, "***")
+        return JSONResponse({"ok": False, "error": msg}, status_code=500)
+
+    models = data.get("models") or []
+    names = []
+    for m in models:
+        if isinstance(m, dict) and m.get("name"):
+            names.append(str(m.get("name")))
+    return JSONResponse({"ok": True, "count": len(names), "models": names[:80]})
 
 
 def _security_id_for_symbol(symbol: str) -> str:

@@ -26,7 +26,13 @@ def _extract_json(text: str) -> dict:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
             raise
-        return json.loads(m.group(0))
+    return json.loads(m.group(0))
+
+def _sanitize_error(s: str) -> str:
+    # Prevent leaking API keys into UI/DB logs. httpx errors may include the full URL.
+    s = s or ""
+    s = re.sub(r"(key=)[^&\s]+", r"\1***", s)
+    return s
 
 
 @dataclass(frozen=True)
@@ -104,7 +110,7 @@ class GeminiDecider:
                 data = r.json()
         except Exception as e:
             store.close()
-            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_error: {e}"}
+            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_error: {_sanitize_error(str(e))}"}
 
         try:
             text = (
@@ -121,11 +127,10 @@ class GeminiDecider:
                 raise ValueError("targets must be list")
         except Exception as e:
             store.close()
-            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_parse_error: {e}"}
+            return {"action": "WAIT", "sl": None, "targets": [], "error": f"gemini_parse_error: {_sanitize_error(str(e))}"}
 
         created_at = datetime.now(timezone.utc).isoformat()
         cache_id = f"gem_{req_hash[:16]}"
         store.set_llm_cache(cache_id, created_at, self.model, req_hash, out)
         store.close()
         return out
-
