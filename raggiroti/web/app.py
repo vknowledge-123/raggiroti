@@ -128,6 +128,41 @@ def _push_live_error(kind: str, detail: object) -> None:
         pass
 
 
+def _extract_list_any(obj: object, keys: list[str]) -> list[str]:
+    """
+    Extract a list[str] from a variety of vendor payload shapes:
+    - direct list
+    - dict containing the list under one of `keys`
+    - dhanhq wrapper: {"status": "...", "data": <payload>}
+    """
+    if obj is None:
+        return []
+    if isinstance(obj, list):
+        out = []
+        for x in obj:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
+    if isinstance(obj, dict):
+        # dhanhq wrapper
+        if obj.get("status") in {"success", "failure"} and "data" in obj:
+            return _extract_list_any(obj.get("data"), keys)
+        for k in keys:
+            if k in obj:
+                out = _extract_list_any(obj.get(k), keys)
+                if out:
+                    return out
+        # Some payloads nest further
+        for v in obj.values():
+            out = _extract_list_any(v, keys)
+            if out:
+                return out
+    return []
+
+
 def _ensure_gemini_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -1212,6 +1247,15 @@ def _start_live_thread(
                     raise SystemExit()
                 try:
                     sec, ltp, vol, dt = parse_marketfeed_tick(msg)
+                except ValueError as e:
+                    # Ignore expected non-LTP packets (prev_close/status/OI) from MarketFeed.
+                    if str(e).startswith("non_ltp_packet:"):
+                        return
+                    try:
+                        _push_live_error("tick_parse_error", {"keys": list((msg or {}).keys())[:12]})
+                    except Exception:
+                        _push_live_error("tick_parse_error", "parse_marketfeed_tick_failed")
+                    return
                 except Exception:
                     try:
                         _push_live_error("tick_parse_error", {"keys": list((msg or {}).keys())[:12]})
@@ -1282,19 +1326,27 @@ def _start_live_thread(
             # For index: under_exchange_segment is typically IDX_I in REST APIs.
             ex_seg = "IDX_I"
             exp = oc.expiry_list(under_security_id=int(security_id), under_exchange_segment=ex_seg)
-            exp_list = exp.get("data") or exp.get("Data") or exp.get("expiryList") or exp.get("expiry_list") or []
-            if isinstance(exp_list, list) and exp_list:
+            exp_list = _extract_list_any(exp, ["data", "Data", "expiryList", "expiry_list", "expiries", "expiry"])
+            if exp_list:
                 expiry = str(exp_list[0])
             else:
-                _push_live_error("oi_error", {"where": "expiry_list", "error": "empty_expiry_list"})
+                # Include a small hint of the returned shape for debugging.
+                try:
+                    keys = list(exp.keys())[:20] if isinstance(exp, dict) else []
+                except Exception:
+                    keys = []
+                _push_live_error("oi_error", {"where": "expiry_list", "error": "empty_expiry_list", "raw_keys": keys})
+                LIVE_OI_LAST_ERROR = "empty_expiry_list"
                 return
         except Exception:
             _push_live_error("oi_error", {"where": "expiry_list", "error": "exception"})
+            LIVE_OI_LAST_ERROR = "expiry_list_exception"
             return
         while not LIVE_STOP.is_set():
             try:
                 chain = oc.option_chain(under_security_id=int(security_id), under_exchange_segment=ex_seg, expiry=expiry)
-                summary = summarize_oi_walls(chain, top_n=5)
+                # Use the robust parser that supports dhanhq wrapper responses.
+                summary = summarize_oi_walls_any(chain, top_n=5)
                 if summary.get("ok"):
                     LIVE_OI_SNAPSHOT = summary
                     LIVE_OI_UPDATED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")

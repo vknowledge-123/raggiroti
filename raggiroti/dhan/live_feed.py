@@ -144,6 +144,10 @@ def parse_marketfeed_tick(msg: dict) -> tuple[str, float, float | None, datetime
 
     ltp = _pick(data, ["LTP", "ltp", "last_traded_price", "LastTradedPrice", "lastTradedPrice"])
     if ltp is None:
+        # MarketFeed also emits non-trade packets (prev_close / status / OI etc).
+        # These do not contain LTP and should be ignored by candle builders.
+        if any(k in data for k in ("prev_close", "prev_OI", "prev_oi", "OI", "oi", "status", "Status")) or str(data.get("type") or "").lower().find("prev") >= 0:
+            raise ValueError(f"non_ltp_packet:{data.get('type') or ''}")
         raise ValueError(f"missing ltp in tick: keys={list(data.keys())[:12]}")
 
     vol = _pick(data, ["volume", "Volume", "total_volume", "TotalVolume", "totalVolume"])
