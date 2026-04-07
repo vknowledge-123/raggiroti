@@ -580,11 +580,14 @@ class NextDayPredictor:
             },
         }
 
-        req_hash = _hash_request({"predict_next_day": prompt_payload, "schema_version": 1})
+        # Bump schema_version whenever the expected output contract changes (e.g., adding flat bucket),
+        # otherwise older cached predictions can be returned with the wrong shape.
+        req_hash = _hash_request({"predict_next_day": prompt_payload, "schema_version": 2})
         store = SqliteStore(self.db_path)
         cached = store.get_llm_cache(req_hash, self.model)
         if cached is not None:
-            store.close()
+            # Validate cached shape; if it doesn't match the current contract, ignore cache and recompute.
+            expected_keys = _expected_bucket_keys(gap_buckets)
             try:
                 if isinstance(cached, dict) and isinstance(cached.get("gap_plans"), dict):
                     plans = []
@@ -596,20 +599,29 @@ class NextDayPredictor:
                     cached["gap_plans"] = plans
             except Exception:
                 pass
-            return NextDayPrediction(
-                ok=True,
-                instrument=instrument,
-                security_id=str(security_id),
-                target_date=target_date,
-                training_start_date=training_start_date,
-                training_end_date=prev_date_used,
-                prev_date_used=prev_date_used,
-                prev_levels={**prev_levels.__dict__, "symbol": instrument},
-                stats=stats,
-                oi=oi_features,
-                retrieved_rules={"rulebook_version": retrieved.rulebook_version, "count": len(retrieved.rules)},
-                prediction=cached,
-            )
+            try:
+                if not (isinstance(cached, dict) and _validate_full_prediction_shape(cached, expected_keys) is None):
+                    cached = None
+            except Exception:
+                cached = None
+            if cached is not None:
+                store.close()
+                cached = _sanitize_prediction_output(cached)
+                return NextDayPrediction(
+                    ok=True,
+                    instrument=instrument,
+                    security_id=str(security_id),
+                    target_date=target_date,
+                    training_start_date=training_start_date,
+                    training_end_date=prev_date_used,
+                    prev_date_used=prev_date_used,
+                    prev_levels={**prev_levels.__dict__, "symbol": instrument},
+                    stats=stats,
+                    oi=oi_features,
+                    retrieved_rules={"rulebook_version": retrieved.rulebook_version, "count": len(retrieved.rules)},
+                    prediction=cached,
+                )
+            # Cached value was invalid for the current schema; fall through to recompute with Gemini.
 
         bucket_schema = {
             "type": "object",
