@@ -63,6 +63,7 @@ LIVE_ENGINE: LiveSimEngine | None = None
 LIVE_CANDLE_BUILDER: CandleBuilder1m | None = None
 LIVE_LOOP: asyncio.AbstractEventLoop | None = None
 LIVE_OI_SNAPSHOT: dict | None = None
+LIVE_LAST_ERROR: str | None = None
 
 SIM_ENGINE: LiveSimEngine | None = None
 
@@ -846,6 +847,8 @@ def _start_live_thread(
     assert LIVE_LOOP is not None, "server loop not ready"
 
     LIVE_STOP.clear()
+    global LIVE_LAST_ERROR
+    LIVE_LAST_ERROR = None
     LIVE_ENGINE = LiveSimEngine(symbol=symbol, security_id=security_id, gemini_api_key=gemini_key, gemini_model=gemini_model, qty=qty)
     if prev_day_candles:
         try:
@@ -900,8 +903,13 @@ def _start_live_thread(
             feed.iter_ticks(on_tick)
         except SystemExit:
             return
-        except Exception:
-            # Best-effort shutdown; UI can restart.
+        except Exception as e:
+            # Best-effort shutdown; UI can restart. Capture error for UI.
+            try:
+                global LIVE_LAST_ERROR
+                LIVE_LAST_ERROR = f"{type(e).__name__}: {e}"
+            except Exception:
+                pass
             return
         finally:
             if feed is not None:
@@ -990,16 +998,29 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
             prev_day_candles=prev_day_candles,
             prev_day_date=prev_day_date,
         )
-    return JSONResponse({"ok": True, "symbol": symbol.upper().strip(), "security_id": sec, "seed": seed_info})
+    # Give the background thread a moment to connect; helps surface immediate failures.
+    time.sleep(0.25)
+    alive = LIVE_THREAD is not None and LIVE_THREAD.is_alive()
+    return JSONResponse(
+        {
+            "ok": True,
+            "symbol": symbol.upper().strip(),
+            "security_id": sec,
+            "seed": seed_info,
+            "thread_alive": alive,
+            "last_error": LIVE_LAST_ERROR,
+        }
+    )
 
 
 @app.post("/api/live/stop")
 def live_stop() -> JSONResponse:
-    global LIVE_ENGINE, LIVE_CANDLE_BUILDER
+    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR
     LIVE_STOP.set()
     with LIVE_LOCK:
         LIVE_ENGINE = None
         LIVE_CANDLE_BUILDER = None
+        LIVE_LAST_ERROR = None
     return JSONResponse({"ok": True})
 
 
@@ -1007,9 +1028,9 @@ def live_stop() -> JSONResponse:
 def live_status() -> JSONResponse:
     running = LIVE_THREAD is not None and LIVE_THREAD.is_alive() and LIVE_ENGINE is not None and not LIVE_STOP.is_set()
     if not running or LIVE_ENGINE is None:
-        return JSONResponse({"ok": True, "running": False})
+        return JSONResponse({"ok": True, "running": False, "last_error": LIVE_LAST_ERROR})
     st = LIVE_ENGINE.status()
-    return JSONResponse({"ok": True, "running": True, "status": asdict(st)})
+    return JSONResponse({"ok": True, "running": True, "status": asdict(st), "last_error": LIVE_LAST_ERROR})
 
 
 @app.get("/api/live/candles")
