@@ -1,0 +1,92 @@
+{
+  "system_name": "Nexus Ultra",
+  "schema_name": "Nexus Ultra RAG Schema",
+  "rulebook_file": "rulebook/nexus_ultra_v2.rulebook.json",
+  "rulebook_version": "2.14.0",
+  "updated_at": "2026-04-07",
+  "timezone": "Asia/Calcutta",
+  "core_philosophy": {
+    "equation": "COMFORT -> LIQUIDITY -> TRAP -> MOVE",
+    "mandatory_questions": [
+      "WHY did price move? (MATRIX-WHY-001 / DT-SL-133..137)",
+      "Where is buyer SL and seller SL? (DT-SL-168..172)",
+      "Is SL hunting valid today? (DT-SL-094..102)"
+    ],
+    "non_negotiables": [
+      "Strict SL; never widen after entry (DT-SL-036/041)",
+      "No averaging losers (DT-SL-041)",
+      "Max 1-2 attempts per idea (DT-SL-039)",
+      "Stop trading on mismatch days (DT-SL-049)",
+      "Fair zone is default no-trade (MATRIX-ZONE-001 / DT-SL-141)"
+    ],
+    "probabilistic_note": "Fake confirmations happen; treat SL as cost and keep expectancy positive (DT-SL-188)."
+  },
+  "pre_market": {
+    "levels": ["PDH", "PDL", "last_hour_high", "last_hour_low", "round_numbers"],
+    "zone_matrix": "MATRIX-ZONE-001",
+    "scenario_planning": {
+      "scenarios": ["gap_up", "gap_down", "flat"],
+      "rules": ["DT-SL-178", "DT-SL-181", "DT-SL-182", "DT-SL-184"]
+    },
+    "bias_backbone": {
+      "engine": "Dow Theory",
+      "rules": ["DT-DOW-001", "DT-DOW-002", "DT-DOW-003", "DT-DOW-004"]
+    }
+  },
+  "opening_engine": {
+    "matrix": "MATRIX-OPEN-001",
+    "gap_rules": ["DT-SL-024", "DT-SL-163", "DT-SL-164", "DT-SL-128"],
+    "adaptation_rules": ["DT-SL-147", "DT-SL-148", "DT-SL-149"]
+  },
+  "intelligence_engines": {
+    "liquidity_layers": {
+      "rules": ["DT-SL-044", "DT-SL-045", "DT-SL-046", "DT-SL-051", "DT-SL-052", "DT-SL-192", "DT-SL-194", "DT-SL-195", "DT-SL-196", "DT-SL-222", "DT-SL-223", "DT-SL-225"]
+    },
+    "validity_filter": {
+      "rules": ["DT-SL-094", "DT-SL-095", "DT-SL-096", "DT-SL-099", "DT-SL-100", "DT-SL-101", "DT-SL-102"]
+    },
+    "comfort_engine": {
+      "rules": ["DT-SL-103", "DT-SL-104", "DT-SL-105", "DT-SL-107", "DT-SL-110"]
+    },
+    "why_engine": {
+      "matrix": "MATRIX-WHY-001",
+      "rules": ["DT-SL-133", "DT-SL-137"]
+    },
+    "probability_engine": {
+      "rules": ["DT-SL-168", "DT-SL-169", "DT-SL-170", "DT-SL-171", "DT-SL-172", "DT-SL-173", "DT-SL-174", "DT-SL-175", "DT-SL-176", "DT-SL-177"]
+    },
+    "trap_engine": {
+      "matrix": "MATRIX-TRAP-001",
+      "rules": ["DT-SL-207", "DT-SL-208", "DT-SL-209", "DT-SL-210", "DT-SL-211", "DT-SL-212"]
+    },
+    "flow_engine": {
+      "rules": ["DT-SL-157", "DT-SL-167", "DT-SL-212"]
+    },
+    "cross_index": {
+      "rules": ["DT-SL-098", "DT-SL-120", "DT-SL-176"]
+    }
+  },
+  "execution_engine": {
+    "timeframes": { "execution": "1m", "confirmation": "5m/15m" },
+    "timeframe_rules": ["DT-SL-121", "DT-SL-122", "DT-SL-123"],
+    "swing_confirmation": ["DT-SL-224"],
+    "day_type_rules": ["DT-SL-132", "DT-SL-055"],
+    "risk_rules": ["DT-SL-039", "DT-SL-041", "DT-SL-053", "DT-SL-067", "DT-SL-188", "DT-SL-192", "DT-SL-194", "DT-SL-196"],
+    "fixed_rr_setups_75_30": {
+      "target_points": 75,
+      "sl_points": 30,
+      "rules": ["DT-SL-213", "DT-SL-214", "DT-SL-215", "DT-SL-216"]
+    },
+    "exit_rules": ["DT-SL-086", "DT-SL-093", "DT-SL-111", "DT-SL-185", "DT-SL-217", "DT-SL-218"],
+    "level_pivots": ["DT-SL-220"],
+    "anti_overfit": ["DT-SL-221"]
+  },
+  "primary_operating_loop": {
+    "loop_id": "LOOP-RAG-005",
+    "fallback_loop_id": "LOOP-RAG-004",
+    "framework_id": "FRAMEWORK-001"
+  },
+  "optional_inputs": {
+    "open_interest": "Secondary confirmation only; prefer option-chain OI with change-in-OI + premium context. Use MATRIX-OI-001 + MATRIX-OI-002 + DT-SL-197..206 and still defer to chart confirmation."
+  }
+}

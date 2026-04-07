@@ -1,0 +1,2380 @@
+{
+  "name": "Nexus Ultra",
+  "version": "2.14.0",
+  "updated_at": "2026-04-07",
+  "timezone": "Asia/Calcutta",
+  "scope": {
+    "market": "India",
+    "instruments": ["index", "equity", "options"],
+    "style": "intraday-first",
+    "broker_api": "Dhan"
+  },
+  "design_notes": [
+    "This rulebook is optimized for retrieval (RAG): each rule is atomic, tagged, and written as condition->interpretation->action.",
+    "Rules are probabilistic: presence of an SL cluster increases probability, but timing/path can be uncertain.",
+    "Execution uses hard risk controls: limited attempts, no averaging, and immediate exit on 'mismatch days'.",
+    "Bias is a hypothesis; market confirmation has veto power and can force dynamic plan switching.",
+    "Plan->Reaction->Adaptation is core: if live behavior mismatches the plan, wait, rebuild structure, then take the second opportunity only after confirmation.",
+    "Operator-centric layer: track likely operator entry, holding, and exit behavior; exits often matter more than entries.",
+    "SL-hunting is conditional: apply validity filters (retail participation, fresh SL availability, profit distribution, and event risk).",
+    "Zone engine reduces overtrading: avoid fair-price conditions; prefer discount/inflated extremes with liquidity confluence.",
+    "Thinking engine reduces narrative bias: classify move source (SL hit vs exit vs fresh entry vs operator push) before acting.",
+    "Flow engine links moves: current move -> trader reaction -> next move; use it to anticipate where new liquidity forms.",
+    "Probability engine selects the highest-probability side using SL availability + validity + zone + confirmation; not the obvious direction.",
+    "Planning engine forces scenario thinking (gap up/down/flat + 2-3 day expectation) and prevents rigid bias.",
+    "Fake confirmations are expected cost: keep SL strict and let expectancy come from small losses and larger winners (DT-SL-188)."
+  ],
+  "changelog": [
+    {
+      "version": "2.1.0",
+      "date": "2026-04-06",
+      "summary": "Added execution adaptability (DT-SL-071..081), operator layer (DT-SL-082..093), and SL-hunting validity filters (DT-SL-094..102)."
+    },
+    {
+      "version": "2.2.0",
+      "date": "2026-04-06",
+      "summary": "Added Comfort Engine (DT-SL-103..110), Exit + Next-day Bias Engine (DT-SL-111..120), and Chart Execution Engine (DT-SL-121..131)."
+    },
+    {
+      "version": "2.3.0",
+      "date": "2026-04-06",
+      "summary": "Added Thinking Engine (DT-SL-132..139), Zone Engine (DT-SL-140..146), and Adaptive Engine (DT-SL-147..156)."
+    },
+    {
+      "version": "2.4.0",
+      "date": "2026-04-06",
+      "summary": "Added Flow Engine (DT-SL-157..167), Probability Engine (DT-SL-168..177), and Planning Engine (DT-SL-178..187)."
+    },
+    {
+      "version": "2.5.0",
+      "date": "2026-04-06",
+      "summary": "Added psychology/behavior stack rules (DT-SL-051..070), RAG Loop v20 (LOOP-RAG-005), and fake-confirmation-as-cost discipline (DT-SL-188)."
+    },
+    {
+      "version": "2.6.0",
+      "date": "2026-04-06",
+      "summary": "Added round-number wall trap logic, stronger reclaim/acceptance thresholds, deep-gap regime handling, and optional OI wall integration (DT-SL-189..193)."
+    },
+    {
+      "version": "2.7.0",
+      "date": "2026-04-06",
+      "summary": "Added micro-sweep/precision stop-hunt handling and stop placement rules to reduce '0-2 point' stop-outs around obvious levels (DT-SL-194..196)."
+    },
+    {
+      "version": "2.8.0",
+      "date": "2026-04-06",
+      "summary": "Added option-chain decoding rules: contract-vs-position clarity, strike selection by premium/volume, change-in-OI interpretation, weekly-vs-monthly alignment, and writer 'premium cushion' pain-threshold logic (DT-SL-197..202, MATRIX-OI-001)."
+    },
+    {
+      "version": "2.9.0",
+      "date": "2026-04-06",
+      "summary": "Added option-chain fallback-to-chart rules, writer pressure vs comfort (premium expansion), weekly-expiry anchor inference, and sub-round 200/800 level behavior (DT-SL-203..206, MATRIX-OI-002)."
+    },
+    {
+      "version": "2.10.0",
+      "date": "2026-04-06",
+      "summary": "Added trap taxonomy matrix (MATRIX-TRAP-001) and integration notes for trap handling; rules implemented in v2.11.0 (DT-SL-207..212)."
+    },
+    {
+      "version": "2.11.0",
+      "date": "2026-04-06",
+      "summary": "Implemented trap taxonomy rules and regime-flip logic from transcripts: sideways/whipsaw traps, post-break failure traps, fear/greed filter, and multi-day regime flip (DT-SL-207..212). Expanded trap matrix with news-event trap."
+    },
+    {
+      "version": "2.12.0",
+      "date": "2026-04-07",
+      "summary": "Added fixed risk-reward setup templates for 75-point targets with 30-point SL (DT-SL-213..216) and integrated them into the RAG schema."
+    },
+    {
+      "version": "2.13.0",
+      "date": "2026-04-07",
+      "summary": "Added volatility-era execution upgrades: mandatory profit booking/locking for regular size, closing-price pivot usage, and profit->loss psychology trap handling to reduce givebacks and pattern-overfit (DT-SL-217..221)."
+    },
+    {
+      "version": "2.14.0",
+      "date": "2026-04-07",
+      "summary": "Added swing-liquidity mapping rules (swing highs/lows as SL pools), plus 1m execution with 5m confirmation gates and swing reclaim/acceptance triggers (DT-SL-222..225)."
+    }
+  ],
+  "decision_matrices": [
+    {
+      "id": "MATRIX-OPEN-001",
+      "name": "Gap + First Candle Confirmation",
+      "inputs": ["gap_type", "first_candle_color"],
+      "rows": [
+        {
+          "gap_type": "gap_down",
+          "first_candle_color": "red",
+          "meaning": "Bearish confirmation; smart-money selling likely active.",
+          "action": "Prioritize SHORT setups; still require structure confirmation before entry."
+        },
+        {
+          "gap_type": "gap_down",
+          "first_candle_color": "green",
+          "meaning": "Trap/volatile; direction unclear.",
+          "action": "Avoid trading OR wait for structure clarity."
+        },
+        {
+          "gap_type": "gap_up",
+          "first_candle_color": "green",
+          "meaning": "Bullish continuation; smart-money buying likely active.",
+          "action": "Prioritize LONG setups; still require structure confirmation before entry."
+        },
+        {
+          "gap_type": "gap_up",
+          "first_candle_color": "red",
+          "meaning": "Trap/volatile; direction unclear.",
+          "action": "Avoid trading OR wait for structure clarity."
+        }
+      ],
+      "tags": ["opening_candle", "gap_logic", "trap_detection"]
+    },
+    {
+      "id": "MATRIX-ZONE-001",
+      "name": "Trading Zone Posture",
+      "inputs": ["zone"],
+      "rows": [
+        {
+          "zone": "discount",
+          "meaning": "Cheap/extreme fear; accumulation and reversal probability increases if liquidity confirms.",
+          "action": "Prefer long ideas after confirmation; allow more aggressive sizing relative to inflated/fair (still within risk limits)."
+        },
+        {
+          "zone": "fair",
+          "meaning": "Balanced price; edge is low; chop and fake moves increase.",
+          "action": "Avoid trading by default. Trade only with exceptional confirmation + strong confluence."
+        },
+        {
+          "zone": "inflated",
+          "meaning": "Expensive/extreme greed; distribution, traps, or continuation possible depending on operator holding.",
+          "action": "Trade with caution: either continuation with momentum/holding signatures OR reversal after comfort+trap confirmation."
+        }
+      ],
+      "tags": ["zone_engine", "risk_filter", "overtrading_prevention"]
+    },
+    {
+      "id": "MATRIX-WHY-001",
+      "name": "Move Driver Classification (WHY Engine)",
+      "inputs": ["move_driver"],
+      "rows": [
+        {
+          "move_driver": "sl_hit",
+          "meaning": "Move is driven by stop-loss liquidation; continuation can accelerate via cascade, but reversals can appear after the target-side liquidity is consumed.",
+          "action": "Trade only after confirmation. If fading, do it only after clear exhaustion + reclaim; otherwise trade with the cascade and capture partials."
+        },
+        {
+          "move_driver": "profit_booking_exit",
+          "meaning": "Move is driven by exits (profit booking or forced exit) rather than fresh entries; follow-through can be weaker or mean-reverting.",
+          "action": "Prefer quick capture and tighter management. Do not assume a new trend until structure confirms."
+        },
+        {
+          "move_driver": "fresh_entry",
+          "meaning": "Move is driven by new participation; it can become trend if acceptance + holding signatures persist.",
+          "action": "Trade continuation only after acceptance; avoid late chase. If comfort becomes extreme, prepare for trap logic."
+        },
+        {
+          "move_driver": "operator_push",
+          "meaning": "Move is driven by dominant participant pushing; can be sudden or gradual-build-then-expansion.",
+          "action": "Align with operator after confirmation; manage exits around operator-exit signatures. Do not fight the push without trap evidence."
+        }
+      ],
+      "tags": ["why_engine", "thinking_engine", "move_driver", "probability"]
+    },
+    {
+      "id": "MATRIX-OI-001",
+      "name": "Option Chain Bias (OI + Change-in-OI)",
+      "inputs": ["ce_oi_vs_pe_oi", "ce_chg_oi", "pe_chg_oi"],
+      "rows": [
+        {
+          "ce_oi_vs_pe_oi": "ce_dominant",
+          "ce_chg_oi": "up",
+          "pe_chg_oi": "down_or_flat",
+          "meaning": "Call writers building while put writers are not building: downside pressure / overhead resistance likely stronger.",
+          "action": "Treat upper strikes as stronger resistance; prefer sell-on-rise and trap logic unless price shows strong acceptance (DT-SL-190)."
+        },
+        {
+          "ce_oi_vs_pe_oi": "pe_dominant",
+          "ce_chg_oi": "down_or_flat",
+          "pe_chg_oi": "up",
+          "meaning": "Put writers building while call writers unwind: bullish bias possible.",
+          "action": "Treat lower strikes as stronger support; prefer long ideas after confirmation. Still defer to chart/structure (DT-SL-028)."
+        },
+        {
+          "ce_oi_vs_pe_oi": "balanced",
+          "ce_chg_oi": "up",
+          "pe_chg_oi": "up",
+          "meaning": "Both sides building: range/mean-reversion regime and trap risk increases.",
+          "action": "Treat as boundary range (OI walls) and prefer sweep+reclaim / failed acceptance over trend chasing (DT-SL-193/055)."
+        },
+        {
+          "ce_oi_vs_pe_oi": "balanced",
+          "ce_chg_oi": "down",
+          "pe_chg_oi": "down",
+          "meaning": "Both sides unwinding: transition/uncertainty; old OI levels may weaken.",
+          "action": "Reduce reliance on OI levels; rebuild from price structure + liquidity map (DT-SL-071/147)."
+        }
+      ],
+      "tags": ["options", "open_interest", "change_in_oi", "bias_matrix", "secondary_signal"]
+    },
+    {
+      "id": "MATRIX-OI-002",
+      "name": "Writer Pressure State (Premium Expansion)",
+      "inputs": ["premium_state"],
+      "rows": [
+        {
+          "premium_state": "comfortable",
+          "meaning": "Option premium is low relative to recent reference/expected writer entry; writers are not threatened by small underlying moves.",
+          "action": "Do not assume OI strike will hold immediately. Expect fake breaks/sweeps around the strike; require sweep+reclaim or strong acceptance (DT-SL-202/190)."
+        },
+        {
+          "premium_state": "pressured",
+          "meaning": "Option premium is expanding rapidly; writer discomfort increases and defense/hedging can change price behavior.",
+          "action": "Treat the strike as more active: reaction speed increases. Still confirm with chart; do not fade a pressured breakout without trap evidence."
+        }
+      ],
+      "tags": ["options", "premium", "writer_pressure", "regime"]
+    },
+    {
+      "id": "MATRIX-TRAP-001",
+      "name": "Trap Type Classification",
+      "inputs": ["trap_type"],
+      "rows": [
+        {
+          "trap_type": "sideways",
+          "meaning": "Low momentum / range hold; both sides wait for big break; the market can farm time + fees and punish impatience.",
+          "action": "Avoid trading inside the middle; trade only range edges after confirmation or wait for strong acceptance away from the range."
+        },
+        {
+          "trap_type": "volatile_whipsaw",
+          "meaning": "Fast up-down moves with no clean one-directional follow-through; both sides get chopped.",
+          "action": "Reduce size/frequency. Avoid adding. Prefer WAIT until structure/zone becomes clearer."
+        },
+        {
+          "trap_type": "breakout_failure",
+          "meaning": "A breakout triggers crowd buying, then fails and reverses; breakout buyers become liquidity.",
+          "action": "Do not chase breakout. Prefer short only after failed acceptance + confirmation."
+        },
+        {
+          "trap_type": "breakdown_failure",
+          "meaning": "A breakdown triggers crowd shorting, then fails and reverses; breakdown sellers become liquidity.",
+          "action": "Do not chase breakdown. Prefer long only after sweep + reclaim + acceptance."
+        },
+        {
+          "trap_type": "psychology_fear_greed",
+          "meaning": "The trap is primarily in trader mindset (fear of buying high, greed chasing break).",
+          "action": "Trade only after confirmation + zone alignment; avoid impulse contrarian trades without evidence."
+        },
+        {
+          "trap_type": "news_event",
+          "meaning": "A trap driven by scheduled news/results/announcements; price can spike both ways and invalidate normal structure/liquidity assumptions.",
+          "action": "Prefer NO TRADE around the event window. If trading, reduce size, avoid chasing the first impulse, and wait for post-event structure + acceptance before any entry."
+        }
+      ],
+      "tags": ["trap", "market_type", "classification", "execution_filter"]
+    }
+  ],
+  "loops": [
+    {
+      "id": "LOOP-RAG-004",
+      "name": "RAG Loop v18 (Planning + Flow + Probability)",
+      "steps": [
+        "Analyze previous session last 15-30 minutes (momentum, rejections, indecision).",
+        "Define an initial hypothesis from Dow structure + key levels (PDH/PDL/round numbers), not a rigid bias.",
+        "Create 3 scenarios (gap up / gap down / flat) and a 2-3 day expectation (multi-day thinking).",
+        "Apply time intelligence: expiry/holiday/event day risk; reduce size or avoid if event-driven.",
+        "Classify current context zone: discount vs fair vs inflated (MATRIX-ZONE-001). Avoid fair zone by default.",
+        "Detect likely operator entry zones (sharp turning points) and which side appears dominant.",
+        "Map psychology: trapped buyers/sellers, hesitation near key levels, fear-based participation, and crowd/trap risk.",
+        "Classify the likely move driver (WHY) using MATRIX-WHY-001: SL hit vs profit booking/exit vs fresh entry vs operator push.",
+        "Link flow: for each major move, predict trader reaction and where new liquidity/comfort will form next.",
+        "Detect comfort zones/clusters: multi-confirmation alignment (index + constituents + correlated indices).",
+        "Build dual scenarios (buyer case vs seller case) and identify likely next liquidity target (which side remains).",
+        "Run SL-hunting validity filter: fresh retail participation, SL availability, profit distribution, and no strong event override.",
+        "Map liquidity pools: (a) existing SL clusters, (b) newly created SL after breaks, (c) profit-holder liquidity.",
+        "Decide SL readiness: immediate vs delayed (1-2 sessions possible) and path type (clean vs trap-heavy).",
+        "Run opening filter: gap type + first candle matrix; if trap/volatile, wait or avoid.",
+        "If opening behavior is unclear or plan mismatches reality, wait 10-20 minutes and rebuild structure before attempting a second opportunity.",
+        "Align timeframes: use higher TF (5/15m) for hypothesis/confirmation and 1m for execution + microstructure validation.",
+        "Confirm with multi-index alignment (e.g., NIFTY + BANKNIFTY); reduce conviction on divergence.",
+        "Select the highest-probability side using SL map + validity + zone + confirmation (not the obvious side).",
+        "Execute only after market confirmation; prefer partial entry scaling; max 1-2 attempts per idea; never average losers; avoid chasing late candles.",
+        "Manage trades: take profits when available; watch operator exit vs continuation signatures; if mismatch persists, stop trading for the day.",
+        "Before major news/events, avoid holding positions and reduce trading aggressiveness.",
+        "Discipline: capture the logical portion (not full move) and cap to 2-3 trades/day unless exceptional clarity exists."
+      ],
+      "tags": ["rag_loop", "institutional_process", "validation_first"]
+    },
+    {
+      "id": "LOOP-RAG-005",
+      "name": "RAG Loop v20 (Operator Intent + Comfort + Validity + Exit)",
+      "steps": [
+        "Analyze last session (last 15-30m): momentum, rejections, close quality.",
+        "Identify big money/operator direction hypothesis (not certainty).",
+        "Detect operator entry/turning points and mark pivots (DT-SL-066).",
+        "Map psychology: buyers vs sellers, trapped/risk holders (DT-SL-065).",
+        "Map liquidity layers: old SL, new SL after breaks, profit-holder future liquidity (DT-SL-044/045).",
+        "Classify likely move driver (WHY) using MATRIX-WHY-001 and anchor it to evidence (DT-SL-133..137).",
+        "Run SL-hunting validity: retail participation + fresh SL availability + profit distribution + no event override (DT-SL-094..102).",
+        "Detect comfort clusters (multi-confirmation alignment) and wait for trap evidence before contrarian (DT-SL-103..110).",
+        "Build dual scenario (buyer case + seller case) and select the next likely target side (DT-SL-113/116).",
+        "Predict direction as probability (timing/path uncertain): allow delay + trap-first paths (DT-SL-035/036/038).",
+        "Opening validation: gap type + first candle matrix; if trap/volatile, wait/rebuild (MATRIX-OPEN-001).",
+        "Confirm behavior: momentum type (SL cascade vs event/flow) and multi-index alignment (DT-SL-043/099/120).",
+        "Execute with operator/flow only after price confirmation; expect occasional fake confirmations and treat SL as cost; max 1-2 attempts per idea; no averaging (DT-SL-073/188/039/041).",
+        "Manage actively: first capture near ~1R; hold runner only if holding evidence persists (DT-SL-067/088).",
+        "Exit fast on operator exit/mismatch signals; stop trading on mismatch day (DT-SL-086/093/049)."
+      ],
+      "tags": ["rag_loop", "operator_intent", "comfort_engine", "validity_filter", "exit_first"]
+    }
+  ],
+  "frameworks": [
+    {
+      "id": "FRAMEWORK-001",
+      "name": "Integrated Master Framework (Dow + SL Hunting + Operator + Psychology)",
+      "principles": [
+        "Comfort -> Liquidity -> Trap -> Move (DT-SL-103..110).",
+        "Plan is a hypothesis; market confirmation has veto power; adapt quickly on mismatch (DT-SL-147/148/071).",
+        "SL clusters indicate probability, not timing; path can be trap-first and time can delay 1-2 sessions (DT-SL-035/036/038).",
+        "Fake confirmations are expected cost; strict SL + attempt limits protect expectancy (DT-SL-188/039/041)."
+      ],
+      "phases": [
+        {
+          "id": "PHASE-01",
+          "name": "Pre-Market Mapping",
+          "goal": "Build an initial hypothesis from structure + key levels + zone + scenarios (not certainty).",
+          "refs": {
+            "loops": ["LOOP-RAG-005"],
+            "matrices": ["MATRIX-ZONE-001"],
+            "rules": ["DT-DOW-001", "DT-DOW-004", "DT-SL-021", "DT-SL-131", "DT-SL-140", "DT-SL-145", "DT-SL-070"]
+          }
+        },
+        {
+          "id": "PHASE-02",
+          "name": "Opening Adaptation",
+          "goal": "Validate (or reject) the plan using opening behavior; wait on unclear opens; take second opportunity only after structure rebuild.",
+          "refs": {
+            "matrices": ["MATRIX-OPEN-001"],
+            "rules": ["DT-SL-022", "DT-SL-024", "DT-SL-147", "DT-SL-148", "DT-SL-149", "DT-SL-163"]
+          }
+        },
+        {
+          "id": "PHASE-03",
+          "name": "Intelligence Engines",
+          "goal": "Decide the highest-probability side using validity + comfort + liquidity layers + flow + psychology stack.",
+          "refs": {
+            "rules": [
+              "DT-SL-094",
+              "DT-SL-095",
+              "DT-SL-096",
+              "DT-SL-097",
+              "DT-SL-099",
+              "DT-SL-100",
+              "DT-SL-101",
+              "DT-SL-102",
+              "DT-SL-103",
+              "DT-SL-110",
+              "DT-SL-051",
+              "DT-SL-052",
+              "DT-SL-044",
+              "DT-SL-045",
+              "DT-SL-046",
+              "DT-SL-157",
+              "DT-SL-167",
+              "DT-SL-133",
+              "DT-SL-137",
+              "DT-SL-065"
+            ]
+          }
+        },
+        {
+          "id": "PHASE-04",
+          "name": "Execution + Management",
+          "goal": "Execute only after confirmation; manage with strict risk, early profit capture, and exit fast on mismatch or operator exit.",
+          "refs": {
+            "rules": [
+              "DT-SL-073",
+              "DT-SL-039",
+              "DT-SL-041",
+              "DT-SL-188",
+              "DT-SL-121",
+              "DT-SL-122",
+              "DT-SL-132",
+              "DT-SL-067",
+              "DT-SL-088",
+              "DT-SL-111",
+              "DT-SL-049",
+              "DT-SL-185"
+            ]
+          }
+        },
+        {
+          "id": "PHASE-05",
+          "name": "Review + Learning",
+          "goal": "Treat losses as feedback; identify wrong assumptions (driver/zone/liquidity readiness) and update the next plan.",
+          "refs": { "rules": ["DT-SL-155", "DT-SL-047", "DT-SL-040"] }
+        }
+      ],
+      "tags": ["framework", "rag", "institutional", "execution_first"]
+    }
+  ],
+  "rules": [
+    {
+      "id": "DT-DOW-001",
+      "category": "Dow Theory",
+      "name": "Market Structure State (HH/HL vs LH/LL)",
+      "condition": "Maintain swing highs/lows on the chosen operating timeframe and evaluate swings primarily using candle body closes (not wick extremes).",
+      "interpretation": "HH+HL implies bullish structure; LH+LL implies bearish structure; mixed structure implies range/transition risk.",
+      "action": "Use structure state to form the initial hypothesis and to rank setups (trend-following higher confidence than counter-trend).",
+      "tags": ["dow_theory", "structure", "bias"]
+    },
+    {
+      "id": "DT-DOW-002",
+      "category": "Dow Theory",
+      "name": "Break of Structure (Continuation vs Failure)",
+      "condition": "Price closes beyond the most recent swing high/low and then shows acceptance (holds/continues rather than instantly reclaiming back).",
+      "interpretation": "A clean break + acceptance supports continuation in that direction; immediate reclaim suggests trap or failed break.",
+      "action": "Trade in the direction of accepted breaks; treat failed breaks as trap candidates and require additional confirmation before entering.",
+      "tags": ["dow_theory", "bos", "acceptance", "trap_detection"]
+    },
+    {
+      "id": "DT-DOW-003",
+      "category": "Dow Theory",
+      "name": "Trend Change Requires Confirmation (CHoCH)",
+      "condition": "A trend-structure breaks opposite to the prevailing structure (e.g., bullish structure breaks a key swing low).",
+      "interpretation": "One break can be a stop-sweep; trend change is more reliable only after follow-through + new swing formation.",
+      "action": "Do not flip bias on the first break alone; require confirmation via acceptance + subsequent lower-high (bearish) or higher-low (bullish).",
+      "tags": ["dow_theory", "trend_change", "confirmation"]
+    },
+    {
+      "id": "DT-DOW-004",
+      "category": "Dow Theory",
+      "name": "Structure-First Level Interpretation",
+      "condition": "Key levels exist (PDH/PDL/round numbers) while a structure hypothesis is defined.",
+      "interpretation": "Levels behave as support/resistance relative to structure intent; the same level can flip role after an accepted break.",
+      "action": "Interpret levels dynamically with structure (aligns with DT-SL-027). Re-evaluate the level role after any accepted break.",
+      "tags": ["dow_theory", "levels", "context"]
+    },
+    {
+      "id": "DT-SL-021",
+      "category": "Pre-Market Smart Money Positioning",
+      "name": "Psychological Trap Close (Range-Middle Close Near Key Level)",
+      "condition": "Previous session closes near a key level (PDH/PDL/round number) after multiple rejections above and below; final close is in the middle of the range.",
+      "interpretation": "Both buyers and sellers hesitate; smart money can accumulate positions without revealing direction.",
+      "action": "Expect a directional move next session but do not assume breakout direction. Use this as a 'setup context' only.",
+      "tags": ["smart_money", "accumulation", "trap_setup"]
+    },
+    {
+      "id": "DT-SL-022",
+      "category": "Opening Candle Engine",
+      "name": "Opening Candle Confirmation (Gap + First Candle)",
+      "condition": "Use MATRIX-OPEN-001 at/after first candle completes.",
+      "interpretation": "Opening behavior provides an early confirmation or a trap signal.",
+      "action": "If matrix says 'trap/volatile', avoid or wait for structure clarity.",
+      "tags": ["opening_candle", "gap_logic", "trap_detection"]
+    },
+    {
+      "id": "DT-SL-023",
+      "category": "Liquidity Logic",
+      "name": "No SL = No Move (Low Liquidity Fuel)",
+      "condition": "After a large move, there are no obvious nearby recent highs/lows or SL clusters.",
+      "interpretation": "Smart money lacks liquidity fuel; strong one-way continuation is less likely immediately.",
+      "action": "Expect consolidation/fake moves. Avoid aggressive entries; prefer waiting for new liquidity creation or clearer structure.",
+      "tags": ["liquidity", "sl_clusters", "avoid_aggressive"]
+    },
+    {
+      "id": "DT-SL-024",
+      "category": "Entry Filter",
+      "name": "Avoid Direct Gap Trade",
+      "condition": "Market opens with a gap (gap up or gap down).",
+      "interpretation": "Immediate trades at open are higher risk due to traps/volatility.",
+      "action": "Do not trade immediately in the gap direction. Wait for pullback, reclaim failure/success, or structure confirmation.",
+      "tags": ["gap", "opening_risk", "wait_for_confirmation"]
+    },
+    {
+      "id": "DT-SL-025",
+      "category": "Strategy Framework",
+      "name": "Dual Plan Model (Trend + Liquidity Counter-Plan)",
+      "condition": "Before market open (or before first trade idea) create two plans.",
+      "interpretation": "Institutional approach: prepare trend-following and counter-trend scenarios based on liquidity availability and traps.",
+      "action": "Plan A: trade with Dow bias. Plan B: trade against bias only when SL cluster + trap logic supports it. Choose one after validation.",
+      "tags": ["multi_scenario", "institutional_logic", "plan_a_plan_b"]
+    },
+    {
+      "id": "DT-SL-026",
+      "category": "Pre-Market Intelligence",
+      "name": "Last 15–30 Minute Momentum Mapping",
+      "condition": "Analyze last 15–30 minutes of previous session for trend strength, rejection, sideways behavior, and close quality.",
+      "interpretation": "Often defines next session momentum and reveals late-session positioning.",
+      "action": "Use as a primary bias input and as a filter for morning setups.",
+      "tags": ["premarket", "momentum", "bias_input"]
+    },
+    {
+      "id": "DT-SL-027",
+      "category": "Level Engineering",
+      "name": "Directional Support/Resistance (Dynamic Levels)",
+      "condition": "A directional bias exists (bullish/bearish).",
+      "interpretation": "Levels are interpreted through intent: the market respects levels aligned with bias more reliably.",
+      "action": "If bearish bias: prioritize resistances and ignore weak supports. If bullish bias: prioritize supports and ignore weak resistances.",
+      "tags": ["levels", "directional_levels", "context"]
+    },
+    {
+      "id": "DT-SL-028",
+      "category": "Reality Check Engine",
+      "name": "Market Validation Rule (Expectation vs Reality)",
+      "condition": "Expected behavior differs from actual behavior (e.g., expect selling but market moves up).",
+      "interpretation": "Your hypothesis is wrong or early.",
+      "action": "Cancel bias, avoid trade, or rebuild plan based on new structure. Market is always right.",
+      "tags": ["validation", "adaptation", "avoid_stubbornness"]
+    },
+    {
+      "id": "DT-SL-029",
+      "category": "Derivatives Insight",
+      "name": "Option Premium Bias (Secondary Confirmation)",
+      "condition": "PUT premiums rising implies bearish pressure; CALL premiums rising implies bullish pressure.",
+      "interpretation": "Options can reflect positioning/hedging pressure.",
+      "action": "Use as secondary confirmation only (never primary). If it contradicts price action, defer to price action.",
+      "tags": ["options", "confirmation", "secondary_signal"]
+    },
+    {
+      "id": "DT-SL-030",
+      "category": "Entry Discipline",
+      "name": "Plan Invalid -> No Trade",
+      "condition": "Opening behavior contradicts the prepared plan or the plan invalidates in real time.",
+      "interpretation": "Forcing entries increases loss frequency on trap days.",
+      "action": "Do not force entry; wait for new structure/hypothesis.",
+      "tags": ["discipline", "no_force", "plan_invalidation"]
+    },
+    {
+      "id": "DT-SL-031",
+      "category": "Execution Timing",
+      "name": "Delayed Entry Advantage",
+      "condition": "Early session is volatile/unclear or conflicts with plan.",
+      "interpretation": "Missing the first trade is acceptable; later clarity improves expectancy.",
+      "action": "Prefer waiting for clearer windows (e.g., after initial chop) over forced open trades.",
+      "tags": ["timing", "patience", "avoid_open_trades"]
+    },
+    {
+      "id": "DT-SL-032",
+      "category": "Liquidity Behavior",
+      "name": "Profit-Holding Participants Reduce Immediate SL Availability",
+      "condition": "Many participants are already in profit and holding positions.",
+      "interpretation": "Stop losses are not easily triggered; price may stall or mean-revert.",
+      "action": "Expect slower movement or reversal; trade smaller or wait for fresh liquidity creation.",
+      "tags": ["profit_holders", "liquidity", "stall_risk"]
+    },
+    {
+      "id": "DT-SL-033",
+      "category": "Precision Trading",
+      "name": "Exact Level Reaction",
+      "condition": "Key levels are identified (PDH/PDL/round numbers/known reaction points).",
+      "interpretation": "Price frequently reacts at precise numbers rather than wide zones.",
+      "action": "Use exact level prices for triggers/invalidation rather than broad ranges (while keeping risk controls).",
+      "tags": ["precision", "levels", "execution"]
+    },
+    {
+      "id": "DT-SL-034",
+      "category": "Risk Management",
+      "name": "Controlled Multi-Entry Sizing",
+      "condition": "Multiple entries are part of a planned setup.",
+      "interpretation": "Risk must decrease after each failed attempt.",
+      "action": "Limit max entries (e.g., 3–4 overall, and see DT-SL-039 for per-idea limit). Reduce size after each failed entry.",
+      "tags": ["risk", "position_sizing", "anti_martingale"]
+    },
+    {
+      "id": "DT-SL-035",
+      "category": "SL Hunting Core Logic",
+      "name": "Time Uncertainty (SL Hunt May Delay 1–2 Sessions)",
+      "condition": "A clear SL cluster is identified.",
+      "interpretation": "Market may target it later, not immediately; consolidation can occur.",
+      "action": "Do not force a trade just because an SL cluster exists. Require readiness/confirmation.",
+      "tags": ["sl_hunting", "time_delay", "patience"]
+    },
+    {
+      "id": "DT-SL-036",
+      "category": "Execution Risk",
+      "name": "Path Uncertainty (Opposite Move Before Real Move)",
+      "condition": "SL level identified, but path is trap-heavy or liquidity is insufficient.",
+      "interpretation": "Price may go opposite first to create/collect liquidity, then move to target.",
+      "action": "Expect early stop-outs; keep SL tight; do not widen SL to 'make it work'.",
+      "tags": ["path_uncertainty", "trap", "tight_sl"]
+    },
+    {
+      "id": "DT-SL-037",
+      "category": "Entry Accuracy",
+      "name": "Correct Bias != Correct Entry",
+      "condition": "Bias is correct but entry timing is wrong.",
+      "interpretation": "Stop-out can occur before the correct move.",
+      "action": "Allow re-entry only under strict attempt limits and only after re-validation.",
+      "tags": ["reentry", "timing", "validation"]
+    },
+    {
+      "id": "DT-SL-038",
+      "category": "Liquidity Formation",
+      "name": "SL Creation Phase (Trap Then Real Move)",
+      "condition": "Market lacks sufficient SL clusters to fuel a clean move.",
+      "interpretation": "Market may first create new buyers/sellers (fresh SL), then hunt them later.",
+      "action": "Treat the first breakout/breakdown as potentially a trap until liquidity confirms consumption.",
+      "tags": ["liquidity_creation", "trap_then_real", "sl_formation"]
+    },
+    {
+      "id": "DT-SL-039",
+      "category": "Trade Limitation",
+      "name": "Max Attempt Rule (Per Idea)",
+      "condition": "A single hypothesis/idea is being traded (same SL target logic).",
+      "interpretation": "Over-attempting a single idea increases losses on delay/path-uncertainty days.",
+      "action": "Max 1–2 attempts per idea. If not triggered, stop trading that idea.",
+      "tags": ["attempt_limit", "overtrading_prevention", "capital_protection"]
+    },
+    {
+      "id": "DT-SL-040",
+      "category": "Risk Philosophy",
+      "name": "Controlled Loss Acceptance",
+      "condition": "Small loss occurs due to time/path uncertainty or trap behavior.",
+      "interpretation": "Loss is part of SL hunting and probabilistic execution.",
+      "action": "Accept small losses; avoid revenge trading; re-enter only with re-validation and within attempt limits.",
+      "tags": ["psychology", "risk", "discipline"]
+    },
+    {
+      "id": "DT-SL-041",
+      "category": "Capital Protection",
+      "name": "No Averaging (No Adding to Losers)",
+      "condition": "A trade is losing in an SL-hunting context.",
+      "interpretation": "Market may delay or invalidate the idea; averaging destroys capital.",
+      "action": "Never average losing positions. Exit and re-evaluate instead.",
+      "tags": ["no_averaging", "risk", "survivability"]
+    },
+    {
+      "id": "DT-SL-188",
+      "category": "Execution Risk",
+      "name": "Fake Confirmation Is a Cost (Not a System Error)",
+      "condition": "A high-quality setup triggers with confirmation (reclaim/acceptance/CHoCH), but price reverses quickly and hits SL (a fake move).",
+      "interpretation": "Markets can spoof common confirmations. Real vs fake is often only obvious after the move; therefore the system is probabilistic.",
+      "action": "Treat fake moves as expected operating cost: keep SL strict, never widen, never average, and allow re-entry only after re-validation and within attempt limits (DT-SL-036/037/039/041). Maintain positive expectancy by cutting losers fast and letting real moves pay larger (DT-SL-088/067).",
+      "tags": ["fake_move", "confirmation_risk", "expectancy", "discipline"]
+    },
+    {
+      "id": "DT-SL-189",
+      "category": "Round Numbers",
+      "name": "Round-Number Wall (1–2 Point Defense Trap)",
+      "condition": "Price repeatedly approaches a major round number (e.g., 26,000) and gets rejected 1–2 points below it multiple times in the first 5–30 minutes.",
+      "interpretation": "Operator/large participants are defending the round number (a liquidity/comfort wall). This often baits breakout buyers into comfort and then hunts their SL downward.",
+      "action": "Do not buy the first 'almost-breakout'. Mark the defended band as a trap zone. Prefer: (A) short after a failed attempt + structure shift (CHoCH) or (B) wait for a clean acceptance above the wall (DT-SL-190) before any long.",
+      "tags": ["round_numbers", "wall", "trap_detection", "opening"]
+    },
+    {
+      "id": "DT-SL-190",
+      "category": "Entry Validation",
+      "name": "Strong Reclaim/Acceptance Threshold (Avoid 1-Tick Traps)",
+      "condition": "Considering an entry based on a reclaim/acceptance at a key level (PDH/PDL/round number) in a high-trap environment (comfort, opening volatility, repeated rejections).",
+      "interpretation": "Micro reclaims (1–2 points/ticks) are frequently spoofed. A stronger reclaim/acceptance reduces fake entries at the cost of worse price.",
+      "action": "Require 'strong acceptance' on the operating timeframe: price must reclaim by a buffer (configurable) AND hold/continue (e.g., 2–3 consecutive 1m closes beyond level, or one clean 5m body close beyond). If acceptance is not strong, treat as trap/WAIT.",
+      "tags": ["acceptance", "reclaim", "confirmation", "anti_spoof"]
+    },
+    {
+      "id": "DT-SL-191",
+      "category": "Gap Logic",
+      "name": "Deep Gap Regime (Below/Above PD Levels)",
+      "condition": "Open occurs far beyond previous day's key levels (e.g., open below PDL or above PDH by a meaningful distance).",
+      "interpretation": "Deep gaps create panic/comfort quickly and increase trap risk. Early chasing often becomes liquidity.",
+      "action": "Primary plan: wait for sweep + reclaim or a clear no-pullback trend day confirmation (DT-SL-132). Shorts after a deep gap down require proof of trend-day refusal to bounce; longs after deep gap down require reclaim/CHoCH + acceptance (DT-SL-190).",
+      "tags": ["gap", "deep_gap", "opening_discipline", "regime"]
+    },
+    {
+      "id": "DT-SL-192",
+      "category": "Risk Management",
+      "name": "Swing-Based SL Placement (Respect Sweep Low/High)",
+      "condition": "Entering after a sweep/reclaim or after a structure shift around a key liquidity level.",
+      "interpretation": "Stops that sit inside the sweep/consolidation are easy to harvest. The logical invalidation is beyond the sweep extreme or the structure pivot, not an arbitrary number.",
+      "action": "Place SL beyond the sweep low/high (or beyond the structure pivot) with size adjusted accordingly (DT-SL-053). Do not shrink SL into noise; do not widen after entry.",
+      "tags": ["stop_loss", "swing", "invalidation", "discipline"]
+    },
+    {
+      "id": "DT-SL-193",
+      "category": "Options Insight",
+      "name": "OI Walls as Comfort Boundaries (Secondary)",
+      "condition": "Option-chain OI shows clear 'mega' call/put walls (e.g., strongest call OI above and strongest put OI below), especially when aligned with round numbers.",
+      "interpretation": "OI walls often mark where the crowd feels safe (writers positioned). Price may range within walls until a trap breaks one side, causing covering.",
+      "action": "Use OI walls only as secondary context: treat call walls as overhead comfort/resistance zones and put walls as support/comfort zones. Prefer SL-hunt setups that push beyond a wall and then reclaim back inside (trap), or accept above/below with strong acceptance (DT-SL-190).",
+      "tags": ["options", "open_interest", "comfort", "boundaries", "secondary_signal"]
+    },
+    {
+      "id": "DT-SL-194",
+      "category": "SL Hunting Core Logic",
+      "name": "Micro-Sweep / Precision Stop-Hunt (0–2 Point Break)",
+      "condition": "Price repeatedly breaks a highly obvious level (round number, day low/high, prior swing) by a tiny amount (e.g., 0–2 points) and quickly reclaims back above/below.",
+      "interpretation": "This is often liquidity engineering: the operator is collecting stops placed at obvious numbers without committing to a full breakdown/breakout.",
+      "action": "Do not place SL exactly at obvious levels. If trading a reclaim, either (A) place SL beyond the micro-sweep extreme (DT-SL-192) with reduced size (DT-SL-053), or (B) wait for strong acceptance away from the level (DT-SL-190) before entry.",
+      "tags": ["micro_sweep", "precision_hunt", "stop_hunt", "round_numbers", "discipline"]
+    },
+    {
+      "id": "DT-SL-195",
+      "category": "Market Type",
+      "name": "Multi-Sweep Range (Tightening -> Breakout Risk)",
+      "condition": "Multiple micro-sweeps occur at one edge of a range (e.g., repeated lows) while highs compress (lower highs) or vice-versa.",
+      "interpretation": "A tightening range is forming. Price can remain choppy while stops are harvested, then break violently once liquidity is sufficient.",
+      "action": "Reduce attempts and avoid trading inside the middle. Prefer waiting for: (A) edge sweep + strong reclaim (DT-SL-190/194) for reversal, or (B) clean break + acceptance (DT-DOW-002) for continuation. If unsure, WAIT (DT-SL-031/187).",
+      "tags": ["range", "compression", "liquidity_engineering", "breakout_risk", "patience"]
+    },
+    {
+      "id": "DT-SL-196",
+      "category": "Risk Management",
+      "name": "Obvious-Stop Buffer Rule (Pre-Defined)",
+      "condition": "Choosing SL placement near obvious reference points (round numbers, day low/high, prior swing, VWAP/value boundaries).",
+      "interpretation": "Many traders cluster stops at the exact obvious number; micro-sweeps are common even when direction later works.",
+      "action": "Pre-define an 'obvious-stop buffer' (configurable) and place SL beyond the cluster, not on it. Compensate by lowering size. Never widen SL after entry (DT-SL-041).",
+      "tags": ["stop_loss", "buffer", "risk", "position_sizing", "anti_spoof"]
+    },
+    {
+      "id": "DT-SL-197",
+      "category": "Options Insight",
+      "name": "OI Is Contracts (Proxy), Not Literal Positions",
+      "condition": "Interpreting option-chain OI levels for bias/support/resistance.",
+      "interpretation": "OI reflects open contracts (buyer + seller matched). It is a proxy for positioning, not a guarantee of direction or a direct map of who is 'right'.",
+      "action": "Use OI only as secondary context (DT-SL-193/029). Always confirm with chart structure + price reaction before trading.",
+      "tags": ["options", "open_interest", "reality_check", "secondary_signal"]
+    },
+    {
+      "id": "DT-SL-198",
+      "category": "Options Insight",
+      "name": "Strike Selection Filter (5–7 Strikes, Real Volume Premiums)",
+      "condition": "Scanning the option chain for meaningful OI levels.",
+      "interpretation": "Very high-premium strikes often have poor bid/ask participation; very low-premium strikes often represent hedges. Both can distort OI interpretation.",
+      "action": "Focus on ~5–7 strikes above and below the live price where option premiums have real volume/participation (avoid extreme illiquid premiums and very cheap hedging premiums). Build OI levels from this 'active band'.",
+      "tags": ["options", "open_interest", "liquidity_filter", "strike_selection"]
+    },
+    {
+      "id": "DT-SL-199",
+      "category": "Options Insight",
+      "name": "OI Levels = Probabilistic Boundaries (Not Instant Support/Resistance)",
+      "condition": "Large call OI or put OI exists at a strike near current price.",
+      "interpretation": "Call-writer heavy strikes often behave like overhead boundaries; put-writer heavy strikes often behave like lower boundaries. But these can be broken temporarily during SL hunts and comfort creation.",
+      "action": "Use OI strikes as boundary candidates and combine with SL hunting: prefer trades that sweep beyond an OI boundary and reclaim (trap) or show strong acceptance (DT-SL-190).",
+      "tags": ["options", "open_interest", "boundaries", "trap_logic"]
+    },
+    {
+      "id": "DT-SL-200",
+      "category": "Options Insight",
+      "name": "Change-in-OI Interpretation (Build vs Unwind)",
+      "condition": "Comparing CE/PE OI and change-in-OI around key strikes.",
+      "interpretation": "Rising OI can mean writing/building; falling OI can mean unwinding/covering. Relative CE vs PE build/unwind provides bias hints but can be noisy.",
+      "action": "Use MATRIX-OI-001 as a secondary bias input. If OI bias contradicts price action/structure, defer to price action (DT-SL-028).",
+      "tags": ["options", "change_in_oi", "bias", "secondary_signal"]
+    },
+    {
+      "id": "DT-SL-201",
+      "category": "Options Insight",
+      "name": "Weekly vs Monthly Alignment (Monthly Dominates Major Trend)",
+      "condition": "Weekly expiry OI suggests one direction while monthly expiry OI suggests another.",
+      "interpretation": "Weekly can drive short-term swings, but monthly positioning often dominates the larger swing and limits extremes (range or sideways-to-directional behavior).",
+      "action": "If weekly and monthly conflict, expect sideways-to-directional (swings + traps). Trade smaller, target partials, and prioritize confirmation. If both align, trend probability increases.",
+      "tags": ["options", "weekly", "monthly", "regime", "trend_filter"]
+    },
+    {
+      "id": "DT-SL-202",
+      "category": "Options Insight",
+      "name": "Writer Premium Cushion (When 'Support' Can Break)",
+      "condition": "Put-writer (support) strike shows very high OI, but price still breaks below it intraday.",
+      "interpretation": "Writers can tolerate adverse price move until the option premium expands back toward their effective sell premium ('pain threshold'). Therefore high put OI does not guarantee immediate defense; the market can break the level first (often as an SL hunt) and recover later.",
+      "action": "Do not buy solely because put OI is high. Wait for either (A) sweep+reclaim, or (B) evidence that premium expansion is forcing defense (writer discomfort). Combine with chart confirmation and strong acceptance (DT-SL-190).",
+      "tags": ["options", "premium_cushion", "support_break", "sl_hunting"]
+    },
+    {
+      "id": "DT-SL-203",
+      "category": "Options Insight",
+      "name": "OI Ambiguity -> Chart First (Fallback Rule)",
+      "condition": "CE/PE OI looks balanced/unclear, or change-in-OI is mixed, or expiry context makes OI interpretation noisy (holiday/event risk).",
+      "interpretation": "Option chain alone may not reveal direction; forcing an OI-based trade increases fake signals.",
+      "action": "Fallback to chart engines: Dow structure + zone + liquidity + opening matrix. Use OI only as boundary context (DT-SL-199/193) after chart bias exists.",
+      "tags": ["options", "fallback", "chart_first", "avoid_overfit"]
+    },
+    {
+      "id": "DT-SL-204",
+      "category": "Options Insight",
+      "name": "Writer Comfort vs Pressure (Premium Expansion Heuristic)",
+      "condition": "Interpreting whether writers will defend a strike immediately during a move into/through an OI wall.",
+      "interpretation": "Writers often tolerate small underlying breaches when premium remains low (comfortable). Defense becomes more likely when premium expands quickly (pressured).",
+      "action": "Classify premium_state using MATRIX-OI-002. If comfortable, expect fake breaks and use sweep+reclaim logic. If pressured, expect faster reactions and treat the wall as more active; still require strong acceptance/confirmation (DT-SL-190).",
+      "tags": ["options", "premium", "writer_pressure", "comfort", "regime"]
+    },
+    {
+      "id": "DT-SL-205",
+      "category": "Level Engineering",
+      "name": "Sub-Round Levels (200/800) Become Active",
+      "condition": "Market repeatedly reacts around sub-round levels (e.g., 46,200 / 46,800) in addition to 0/50/100 round numbers.",
+      "interpretation": "As positioning shifts, new 'active' magnets appear. Traders adapt; operators often defend/attack these sub-round nodes, creating repeatable fake breaks and rejections.",
+      "action": "Include 200/800 levels as key intraday nodes when you observe repeated reactions. Treat them like round numbers: expect micro-sweeps, place SL beyond obvious clusters (DT-SL-194/196), and demand strong acceptance for true breaks (DT-SL-190).",
+      "tags": ["levels", "round_numbers", "sub_round", "micro_sweep"]
+    },
+    {
+      "id": "DT-SL-206",
+      "category": "Options Insight",
+      "name": "Weekly Expiry Start Anchor (Infer Writers via First Post-Expiry Reaction)",
+      "condition": "A new weekly expiry cycle starts and price quickly forms a pivot (support/resistance) near a key strike/level.",
+      "interpretation": "Early-cycle pivots often reflect fresh writer positioning; that anchor can shape the week's range.",
+      "action": "Mark the first clear weekly-cycle pivot level as an anchor. Use it as a boundary in scenario planning (gap up/down/flat) and expect fake breaks around it unless strong acceptance appears (DT-SL-190).",
+      "tags": ["options", "weekly", "expiry", "anchor", "range"]
+    },
+    {
+      "id": "DT-SL-207",
+      "category": "Trap Engine",
+      "name": "Trap Classification First (Trade the Trap Type, Not the Candle)",
+      "condition": "Market behavior feels confusing or contradictory (breaks fail, fast reversals, no follow-through, or repeated stop-outs near obvious levels).",
+      "interpretation": "Different trap regimes require different execution: sideways traps punish impatience; volatile whipsaw traps punish tight stops and overtrading; breakout/breakdown failures punish chasing; news traps invalidate normal assumptions.",
+      "action": "Before the next attempt, classify trap_type using MATRIX-TRAP-001. Then apply the trap-specific action and reduce attempts/size until structure + acceptance is clear (DT-SL-039/187/190).",
+      "tags": ["trap", "classification", "execution_filter", "discipline"]
+    },
+    {
+      "id": "DT-SL-208",
+      "category": "Trap Engine",
+      "name": "Sideways Trap (Range Farming)",
+      "condition": "Price remains inside a range with low momentum; both sides wait for a big breakout/breakdown; repeated small fake moves occur.",
+      "interpretation": "The market farms time and impatience. Traders lose via churn, fees, and multiple small stop-outs, even when the eventual breakout is real.",
+      "action": "Avoid the middle. Either (A) trade only edges after sweep+reclaim confirmation (DT-SL-190/194), or (B) wait for clean break + acceptance away from the range (DT-DOW-002). Keep size small and cap attempts to 1 per side.",
+      "tags": ["sideways", "range", "chop", "patience", "no_trade_zone"]
+    },
+    {
+      "id": "DT-SL-209",
+      "category": "Trap Engine",
+      "name": "Volatile Whipsaw Trap (Fast Up-Down, No One-Direction Follow-Through)",
+      "condition": "Large candles alternate directions quickly; moves retrace rapidly; both buyers and sellers get stopped repeatedly.",
+      "interpretation": "Volatility is being used as a trap tool. Microstructure becomes noisy; tight 'perfect' stops are easy targets; chasing becomes instant liquidity.",
+      "action": "Reduce size and frequency. Do not add/pyramid. Prefer WAIT 5-15 minutes to rebuild structure on 5m and re-enter only after acceptance/reclaim is clear (DT-SL-148/121/190). If whipsaw persists, stop trading for the session (DT-SL-049/187).",
+      "tags": ["volatile", "whipsaw", "risk", "no_pyramid", "wait"]
+    },
+    {
+      "id": "DT-SL-210",
+      "category": "Trap Engine",
+      "name": "Post-Break Trap (Breakout/Breakdown Failure After Trigger)",
+      "condition": "A breakout/breakdown triggers obvious participation, but price fails to accept beyond the level and quickly reclaims back inside.",
+      "interpretation": "The break was used to create fresh SL pools (new participants). Failure converts those participants into liquidity, often accelerating the opposite move.",
+      "action": "Do not chase the break. Trade only after failure confirmation: (A) breakout failure -> look for sell after failed acceptance + reclaim below the level; (B) breakdown failure -> look for buy after sweep + reclaim above the level. Use the broken level as a pivot and place SL beyond micro-sweep extremes (DT-SL-194/196).",
+      "tags": ["breakout_failure", "breakdown_failure", "trap", "pivot", "reclaim"]
+    },
+    {
+      "id": "DT-SL-211",
+      "category": "Psychology Control",
+      "name": "Fear/Greed Trap Filter (Mindset-Driven Losses)",
+      "condition": "You hesitate to buy because price looks 'too high' after multiple green candles, or you feel urgency to chase a breakout/breakdown to not miss the move.",
+      "interpretation": "These are common mindset traps: fear leads to early counter-trend sells; greed leads to late entries that become liquidity.",
+      "action": "No impulse entries. Follow the rulebook triggers only: zone alignment (MATRIX-ZONE-001), liquidity evidence, and confirmation (DT-SL-190/073). If you missed the move, skip and wait for the next setup (DT-SL-173).",
+      "tags": ["psychology", "fear", "greed", "no_chase", "discipline"]
+    },
+    {
+      "id": "DT-SL-212",
+      "category": "Flow Engine",
+      "name": "Regime Flip After Multi-Day One-Side Move (Which Break Fails Changes)",
+      "condition": "Market has moved strongly for 3-5 sessions in one direction and then prints a 'final' breakout/breakdown close that makes the direction look obvious to the crowd.",
+      "interpretation": "Psychology saturates: after multi-day selling, sellers crowd in and the next trap often becomes a breakdown-failure (seller trap). After multi-day buying, buyers crowd in and the next trap often becomes a breakout-failure (buyer trap).",
+      "action": "Next session, be alert for the opposite trap type: after multi-day sell + breakdown close -> prioritize breakdown-failure long setups (sweep below + reclaim). After multi-day buy + breakout close -> prioritize breakout-failure short setups (fake break + reclaim back under). Require acceptance/confirmation; do not pre-commit (DT-SL-147/183).",
+      "tags": ["regime_flip", "multi_day", "crowd_shift", "trap", "flow"]
+    },
+    {
+      "id": "DT-SL-042",
+      "category": "Liquidity Engine",
+      "name": "Sudden Capital Injection (Operator Push)",
+      "condition": "Market shows accumulation/slow build behavior.",
+      "interpretation": "Operator can inject large capital suddenly, triggering fast directional movement.",
+      "action": "If accumulation + sudden expansion appears, expect momentum continuation and SL cascade risk; manage entries and SL accordingly.",
+      "tags": ["operator", "sudden_move", "accumulation_to_expansion"]
+    },
+    {
+      "id": "DT-SL-043",
+      "category": "Momentum Logic",
+      "name": "Chain Reaction (SL Cascade)",
+      "condition": "Initial move hits small SLs, causing price acceleration.",
+      "interpretation": "Momentum can be a liquidity chain reaction rather than organic trend.",
+      "action": "On cascade behavior, avoid fading blindly; prefer trading with cascade only when structure supports it.",
+      "tags": ["sl_cascade", "momentum", "liquidity_chain"]
+    },
+    {
+      "id": "DT-SL-044",
+      "category": "Liquidity Mapping",
+      "name": "New Liquidity Creation (Break -> New Participants -> Fresh SL)",
+      "condition": "A breakout/breakdown occurs at a key level.",
+      "interpretation": "New traders enter and create fresh SL pools; liquidity map changes dynamically.",
+      "action": "Track both old SL and newly created SL after breaks; re-evaluate target selection accordingly.",
+      "tags": ["new_liquidity", "breakout", "dynamic_mapping"]
+    },
+    {
+      "id": "DT-SL-045",
+      "category": "Behavioral Liquidity",
+      "name": "Profit Holder Trap (Future Liquidity)",
+      "condition": "Participants are in profit and holding instead of exiting.",
+      "interpretation": "These positions can become future liquidity targets (future SL/forced exits).",
+      "action": "Include profit-holder positioning in liquidity map; avoid assuming immediate continuation without fresh liquidity.",
+      "tags": ["profit_holders", "future_liquidity", "positioning"]
+    },
+    {
+      "id": "DT-SL-046",
+      "category": "Level Behavior",
+      "name": "Level Break Liquidity Shift",
+      "condition": "A key level breaks (e.g., round number like 50,000).",
+      "interpretation": "Participants enter in the direction of the break; SL pools form quickly around the level.",
+      "action": "Treat the break as a liquidity shift event; update SL map and avoid late chasing without a pullback/structure.",
+      "tags": ["level_break", "liquidity_shift", "round_numbers"]
+    },
+    {
+      "id": "DT-SL-047",
+      "category": "Execution Risk",
+      "name": "Partial Correctness Failure (Missing Liquidity Layer)",
+      "condition": "Support/trend/structure analysis is correct but trade fails.",
+      "interpretation": "Failure can come from missing liquidity creation/participant layer rather than wrong structure.",
+      "action": "When stopped out, re-check liquidity map (old/new/profit-holders) before retrying the same idea.",
+      "tags": ["post_mortem", "liquidity_layers", "avoid_repeat_error"]
+    },
+    {
+      "id": "DT-SL-048",
+      "category": "Meta Logic",
+      "name": "Market Compatibility Principle",
+      "condition": "Strategy performs well only in certain market phases (trend/cascade/accumulation).",
+      "interpretation": "Some days are decoding-match; some days are mismatch.",
+      "action": "Continuously evaluate compatibility using DT-SL-049. If mismatch, stop trading.",
+      "tags": ["meta", "phase_detection", "strategy_fit"]
+    },
+    {
+      "id": "DT-SL-049",
+      "category": "Risk Control",
+      "name": "Decoding Mismatch Day -> Stop Trading",
+      "condition": "Multiple consecutive plan failures, unpredictable whipsaws, or repeated invalidations early in session.",
+      "interpretation": "Your decoding logic is mismatched to the day's operator behavior/phase.",
+      "action": "Exit fast and stop trading for the day (or reduce to observation-only mode).",
+      "tags": ["kill_switch", "mismatch_day", "drawdown_control"]
+    },
+    {
+      "id": "DT-SL-050",
+      "category": "Execution Pattern",
+      "name": "Gradual Build -> Sudden Move",
+      "condition": "Slow accumulation/consolidation precedes a sharp expansion candle/impulse.",
+      "interpretation": "Operator behavior: build quietly then push suddenly (aligns with velocity logic).",
+      "action": "Combine with opening and liquidity phase checks; avoid entering late after the sudden push without pullback/structure.",
+      "tags": ["accumulation", "expansion", "velocity"]
+    },
+    {
+      "id": "DT-SL-051",
+      "category": "Liquidity Targeting",
+      "name": "Risk Zone Targeting (Zones, Not Individuals)",
+      "condition": "Mapping SL-hunting targets for the next move.",
+      "interpretation": "Markets often target common risk zones where many stops sit (breakouts/breakdowns/obvious entries), not individual traders.",
+      "action": "Map the crowd's likely entry zones and typical stop zones around them; treat zones as probabilistic targets and still require confirmation before entries.",
+      "tags": ["risk_zones", "crowd", "sl_hunting", "targeting"]
+    },
+    {
+      "id": "DT-SL-052",
+      "category": "Behavioral Model",
+      "name": "Retail Predictability (Common Entries + Fixed SL Distances)",
+      "condition": "Retail participation is present and breakouts/breakdowns are being attempted repeatedly.",
+      "interpretation": "Retail entries and stop distances are often clustered and predictable, creating dense SL pools.",
+      "action": "Use a configurable proxy for typical SL distances (e.g., ~100–200 BankNifty points) around obvious breakout/breakdown levels and round numbers; validate with swing clusters and reaction behavior.",
+      "tags": ["retail", "sl_distance", "clustering", "liquidity_map"]
+    },
+    {
+      "id": "DT-SL-053",
+      "category": "Risk Management",
+      "name": "Adaptive SL Range (Pre-Defined; Never Widen After Entry)",
+      "condition": "Tight SL entries are repeatedly noise-stopped or entry precision is low in the current phase.",
+      "interpretation": "Tight SL can be hunted, but widening SL after entry is destructive and usually narrative-driven.",
+      "action": "Choose one: (A) improve entry precision and keep SL tight (preferred), or (B) pre-define a slightly wider SL with smaller size. Never widen SL after entry (DT-SL-036/041).",
+      "tags": ["sl_size", "risk", "noise", "discipline"]
+    },
+    {
+      "id": "DT-SL-054",
+      "category": "Trend Authority",
+      "name": "Big Money Dominance (Flow > Retail Excitement)",
+      "condition": "Retail excitement (obvious breakout buying/selling) conflicts with operator/flow signals or liquidity logic.",
+      "interpretation": "Sustained trend follows larger capital direction; retail flow alone is not proof of continuation.",
+      "action": "Weight structure + operator behavior + liquidity flow higher than retail excitement. Treat retail-only breakouts as trap candidates until confirmed by acceptance/structure and validity filters.",
+      "tags": ["big_money", "operator", "trend", "filter"]
+    },
+    {
+      "id": "DT-SL-055",
+      "category": "Market Phase",
+      "name": "Range SL Farming (Both Sides Repeatedly Trapped)",
+      "condition": "Higher-TF structure is mixed/ranging and breaks repeatedly fail (false breakouts/breakdowns).",
+      "interpretation": "Range markets harvest SL on both sides; breakout chasing becomes low expectancy.",
+      "action": "Avoid chasing range breaks. Prefer sweep+reclaim, failed acceptance, and liquidity-target setups near range edges; apply fair-zone veto by default (DT-SL-141).",
+      "tags": ["range", "sl_farming", "fakeout", "strategy_selection"]
+    },
+    {
+      "id": "DT-SL-056",
+      "category": "Directional Bias",
+      "name": "Repeated Outcome Bias (Follow the Side That Keeps Working)",
+      "condition": "Recent sessions repeatedly reward one side (e.g., downside moves pay quickly; pullbacks fail; puts work consistently).",
+      "interpretation": "Positioning/phase can favor one side for a period; fighting it increases stop-outs.",
+      "action": "Use repeated outcomes as a bias weight (not a trigger). Reduce contrarian attempts against the dominant side unless trap confirmation is exceptional.",
+      "tags": ["bias", "outcome", "positioning", "probability"]
+    },
+    {
+      "id": "DT-SL-057",
+      "category": "Phase Detection",
+      "name": "Trend Transition Warning (Edge Degrades)",
+      "condition": "Consecutive losses, repeated invalidations, or your usual high-quality conditions stop working.",
+      "interpretation": "Market phase may be transitioning; your decoding becomes unreliable.",
+      "action": "Reduce size/frequency, shift to observation-first, and use mismatch kill switch if instability persists (DT-SL-049).",
+      "tags": ["transition", "meta", "risk_reduction", "kill_switch"]
+    },
+    {
+      "id": "DT-SL-058",
+      "category": "Pattern Validity",
+      "name": "Direction Dependency (Pattern Needs Correct Bias)",
+      "condition": "A familiar pattern appears but directional confluence is missing or psychology contradicts it.",
+      "interpretation": "Patterns lose expectancy when bias/positioning is wrong; the same pattern can fail repeatedly in a phase shift.",
+      "action": "Use patterns only after bias selection (structure + liquidity + psychology) and price confirmation (DT-SL-073). If direction is unclear, wait.",
+      "tags": ["pattern", "direction", "confluence", "patience"]
+    },
+    {
+      "id": "DT-SL-059",
+      "category": "Discipline",
+      "name": "Intraday Integrity (Do Not Convert to Positional)",
+      "condition": "You feel tempted to hold an intraday trade longer due to hope or 'it will come back'.",
+      "interpretation": "Positional holding without thesis destroys intraday expectancy and increases drawdown.",
+      "action": "Follow invalidation exits strictly (DT-SL-185). Never convert intraday trades into positional holds.",
+      "tags": ["intraday", "discipline", "risk"]
+    },
+    {
+      "id": "DT-SL-060",
+      "category": "Psychology Control",
+      "name": "Emotion Distortion Triggers (Profit -> Greed, Loss -> Fear)",
+      "condition": "After a win/loss, you feel urgency to trade bigger, average, or revenge trade.",
+      "interpretation": "Emotion distorts execution and turns you into liquidity (overtrading, holding losers, averaging).",
+      "action": "Enforce cool-down and strict attempt limits (DT-SL-039). Never average losers (DT-SL-041). Stop early on mismatch signals (DT-SL-049).",
+      "tags": ["psychology", "emotion", "overtrading", "control"]
+    },
+    {
+      "id": "DT-SL-061",
+      "category": "Trend Engine",
+      "name": "Psychology -> Trend Formation",
+      "condition": "Setting bias before clear trend is visible.",
+      "interpretation": "Trend is often an outcome of psychology shift + forced risk transfer (trapped participants) rather than the starting point.",
+      "action": "Map who is trapped/confident/at risk and where their exits/SLs sit; expect trend to form after liquidity is created/consumed. Validate with structure + confirmation before execution.",
+      "tags": ["psychology", "pretrend", "trend_engine", "positioning"]
+    },
+    {
+      "id": "DT-SL-062",
+      "category": "Liquidity Logic",
+      "name": "One-Sided Market -> Forced Opposite Move (Create Liquidity)",
+      "condition": "Only one side is active (only buyers or only sellers) and the opposite side is absent/scared (DT-SL-162).",
+      "interpretation": "One-sided conditions often stall or force an opposite move to create participation and new SL liquidity.",
+      "action": "Avoid chasing one-sided breakouts/breakdowns. Wait for two-sided participation or expect pullback/sweep behavior before the real move.",
+      "tags": ["one_sided", "liquidity_creation", "patience", "validity_filter"]
+    },
+    {
+      "id": "DT-SL-063",
+      "category": "Crowd Logic",
+      "name": "Crowd Imbalance Principle (High Crowd -> Low Profit)",
+      "condition": "Crowd participation becomes obvious (comfort cluster / crowded alignment).",
+      "interpretation": "Where the crowd is highest, edge is often lowest; trap probability increases.",
+      "action": "Avoid entering at peak crowd comfort. Prefer post-trap entries after confirmation (DT-SL-103..110) or trade the dominant side earlier only with strong validity.",
+      "tags": ["crowd", "overcrowding", "comfort", "contrarian"]
+    },
+    {
+      "id": "DT-SL-064",
+      "category": "Direction Override",
+      "name": "Psychology Over Chart/News (When Positioning Conflicts)",
+      "condition": "News/chart looks strongly bullish/bearish but positioning is one-sided and comfort is extreme.",
+      "interpretation": "News and obvious chart patterns can be used to attract the crowd; positioning/psychology can dominate direction next.",
+      "action": "Do not trade purely on news or obvious breakout. Require liquidity + confirmation; allow contrarian bias only after trap evidence appears.",
+      "tags": ["psychology", "news", "positioning", "confirmation"]
+    },
+    {
+      "id": "DT-SL-065",
+      "category": "Risk Mapping",
+      "name": "Risk Holder Identification (Gap Up Buyers-at-Risk, Gap Down Sellers-at-Risk)",
+      "condition": "Market opens with a gap relative to previous close.",
+      "interpretation": "The open defines initial trapped/risk holders and shapes early liquidity targeting.",
+      "action": "Identify who is initially at risk (gap up -> buyers; gap down -> sellers). Prefer trading against trapped risk holders after confirmation (failed acceptance, sweep+reclaim, rejection).",
+      "tags": ["gap", "trapped", "risk_holders", "bias"]
+    },
+    {
+      "id": "DT-SL-066",
+      "category": "Trend Signal",
+      "name": "Turning Point Detection (Sudden Reversal = Strong Operator Entry)",
+      "condition": "After a move, a sudden reversal/impulse appears (sharp candle + follow-through).",
+      "interpretation": "Operator entry can flip psychology quickly and start a new trend leg or continuation.",
+      "action": "Treat as a high-signal event: wait for structure shift + acceptance/reclaim, then align with the new direction; avoid immediate fading without proof.",
+      "tags": ["turning_point", "operator", "reversal", "structure_shift"]
+    },
+    {
+      "id": "DT-SL-067",
+      "category": "Execution",
+      "name": "Intraday Target Discipline (Default ~1:1 Capture)",
+      "condition": "Managing targets in intraday SL-hunting trades.",
+      "interpretation": "Overholding increases giveback and trap risk; consistent partial capture improves expectancy.",
+      "action": "Default: take first profit near ~1:1 RR or a nearby liquidity objective. Hold remainder only if holding/continuation evidence persists (DT-SL-088/165).",
+      "tags": ["targets", "rr", "discipline", "partials"]
+    },
+    {
+      "id": "DT-SL-068",
+      "category": "Structure Validity",
+      "name": "Gap Distance Invalidation (Very Large Gaps)",
+      "condition": "Gap is very large (e.g., ~300–400 BankNifty points) or extreme vs recent volatility.",
+      "interpretation": "Prior micro-structure and levels can lose relevance; a new intraday chart forms quickly.",
+      "action": "Apply large-gap discipline: treat as new chart (DT-SL-163), rebuild structure in first 10–20 minutes, and avoid aggressive early trades.",
+      "tags": ["gap", "structure_validity", "new_chart", "opening_discipline"]
+    },
+    {
+      "id": "DT-SL-069",
+      "category": "Strategy",
+      "name": "Contrarian Edge (Trade Against Crowd After Comfort)",
+      "condition": "Crowd is committed/comfortable (obvious breakout, alignment, heavy participation).",
+      "interpretation": "Crowd comfort creates dense SL pools and can become the next target.",
+      "action": "Do not pre-empt. Prefer contrarian only after trap confirmation (failed break, sweep+reclaim, operator exit). Enforce strict invalidation + attempt limits.",
+      "tags": ["contrarian", "comfort", "trap_detection", "execution"]
+    },
+    {
+      "id": "DT-SL-070",
+      "category": "Intelligence Layer",
+      "name": "Multi-Factor Psychology Stack (Bias Selector)",
+      "condition": "Selecting directional bias for the session/day.",
+      "interpretation": "Single-factor bias is fragile; higher confidence comes from stacked evidence.",
+      "action": "Score bias using: Dow structure, opening context (gap + first candle), liquidity layers (old/new/profit-holders), risk holders (DT-SL-065), crowd comfort/overcrowding, and optional OI as secondary confirmation. Execute only if stack aligns + price confirms (DT-SL-073).",
+      "tags": ["psychology_stack", "bias", "confluence", "probability"]
+    },
+    {
+      "id": "DT-SL-071",
+      "category": "Execution Engine",
+      "name": "Dynamic Plan Switching",
+      "condition": "An initial plan exists, but live price action invalidates it or shows strong opposite behavior.",
+      "interpretation": "A pre-decided plan is dangerous; the market-driven plan has priority.",
+      "action": "Switch bias (or go flat) immediately, rebuild hypothesis from structure + liquidity, and re-enter only after confirmation.",
+      "tags": ["adaptation", "dynamic_plan", "execution"]
+    },
+    {
+      "id": "DT-SL-072",
+      "category": "Bias Control",
+      "name": "No Fixed Formula",
+      "condition": "You are about to trade using a rigid mapping (e.g., 'gap up always sell' or 'breakout always buy').",
+      "interpretation": "Rigid formulas ignore market context and operator intent.",
+      "action": "Do not auto-trade. Require context + confirmation (structure/liquidity/price behavior) before any entry.",
+      "tags": ["anti_rigid", "context_first", "confirmation"]
+    },
+    {
+      "id": "DT-SL-073",
+      "category": "Entry Validation",
+      "name": "Market Confirmation Before Entry",
+      "condition": "A trade idea exists based on bias/liquidity/psychology.",
+      "interpretation": "Prediction without confirmation is low quality in live markets.",
+      "action": "Enter only after price confirms (e.g., reclaim + hold, rejection + continuation, or structure break + acceptance).",
+      "tags": ["confirmation", "entry_filter", "price_action"]
+    },
+    {
+      "id": "DT-SL-074",
+      "category": "Execution Strategy",
+      "name": "Wait vs Early Entry Trade-off",
+      "condition": "Choosing between early entry (higher RR) vs confirmed entry (higher accuracy).",
+      "interpretation": "Early entries improve RR but reduce accuracy; confirmed entries reduce RR but improve reliability.",
+      "action": "Prefer confirmed entries by default. If taking early entry, reduce size and enforce strict invalidation.",
+      "tags": ["timing", "risk_tradeoff", "position_sizing"]
+    },
+    {
+      "id": "DT-SL-075",
+      "category": "Market Condition",
+      "name": "Pattern Instability Detection",
+      "condition": "Repeated whipsaw behavior (sell -> recover -> sell -> recover) with no clean acceptance.",
+      "interpretation": "Unstable structure; high trap risk.",
+      "action": "Reduce size, tighten risk, avoid aggressive bias, or shift to observation-only until structure stabilizes.",
+      "tags": ["instability", "chop", "avoid_aggressive"]
+    },
+    {
+      "id": "DT-SL-076",
+      "category": "Precision Levels",
+      "name": "Round Number Activation",
+      "condition": "Price is near a major round number (e.g., 42000 / 50000).",
+      "interpretation": "Round numbers attract participation; breaks often create new liquidity and faster reactions.",
+      "action": "Treat breaks as liquidity shift events; avoid late chasing and prefer pullback/confirmation entries.",
+      "tags": ["round_numbers", "liquidity_shift", "precision"]
+    },
+    {
+      "id": "DT-SL-077",
+      "category": "Confirmation",
+      "name": "Multi-Index Alignment (NIFTY + BANKNIFTY)",
+      "condition": "Trading index direction intraday.",
+      "interpretation": "Alignment increases conviction; divergence increases trap risk.",
+      "action": "If both align, confidence increases. If divergence, reduce size or wait for clearer confirmation.",
+      "tags": ["correlation", "confirmation", "indices"]
+    },
+    {
+      "id": "DT-SL-078",
+      "category": "Entry Logic",
+      "name": "Technical + Psychology Hybrid Entry",
+      "condition": "A psychological narrative exists but needs execution trigger.",
+      "interpretation": "Psychology alone can be ambiguous; technical triggers reduce subjectivity.",
+      "action": "Use a hybrid gate: require (psychology + liquidity) AND a technical trigger (reclaim/rejection/acceptance) before entry.",
+      "tags": ["hybrid", "execution_trigger", "reduce_subjectivity"]
+    },
+    {
+      "id": "DT-SL-079",
+      "category": "Discipline",
+      "name": "Missed Trade Acceptance",
+      "condition": "The optimal entry is missed and price moves away.",
+      "interpretation": "Chasing increases error rate and trap risk.",
+      "action": "Skip the trade; wait for a new setup or a new pullback-based confirmation.",
+      "tags": ["no_chase", "discipline", "patience"]
+    },
+    {
+      "id": "DT-SL-080",
+      "category": "Position Management",
+      "name": "Partial Entry Scaling",
+      "condition": "A setup is valid but confirmation is still building.",
+      "interpretation": "Scaling reduces exposure while letting the market prove the move.",
+      "action": "Enter partial size first; add only after further confirmation, always respecting max risk and attempt limits.",
+      "tags": ["scale_in", "risk_control", "confirmation"]
+    },
+    {
+      "id": "DT-SL-081",
+      "category": "Execution Philosophy",
+      "name": "Market Effort Principle",
+      "condition": "You feel the need to 'force' a trade or predict every move.",
+      "interpretation": "Not everything is the trader's job; let the market confirm and do the work.",
+      "action": "Wait for confirmation and structure. If market does not confirm, do not trade.",
+      "tags": ["patience", "confirmation", "avoid_force"]
+    },
+    {
+      "id": "DT-SL-082",
+      "category": "Operator Logic",
+      "name": "Turning Point Entry Detection",
+      "condition": "A sharp reversal/turning point occurs (often near a key level or after a sweep).",
+      "interpretation": "Assume operator entry/defense around the turning point (exact entry is not visible).",
+      "action": "Mark the turning point as an operator zone; prefer trading in alignment once confirmation appears.",
+      "tags": ["operator", "turning_point", "context"]
+    },
+    {
+      "id": "DT-SL-083",
+      "category": "Capital Behavior",
+      "name": "Unit-Based Capital Deployment",
+      "condition": "Price turns gradually with repeated small defenses rather than one clean reversal.",
+      "interpretation": "Operators deploy in phases/units, not a single full-size entry.",
+      "action": "Expect accumulation/distribution behavior; avoid assuming 'one candle = done'. Use partial entries and confirmation.",
+      "tags": ["operator", "phased_entry", "accumulation"]
+    },
+    {
+      "id": "DT-SL-084",
+      "category": "Market Structure",
+      "name": "Operator Hierarchy (Bigger Overrides Smaller)",
+      "condition": "A move from one side is repeatedly invalidated by a larger, stronger impulse from the opposite side.",
+      "interpretation": "Larger operators can override smaller ones; dominance can change.",
+      "action": "Follow the dominant impulse after confirmation; avoid fighting strength based on older bias.",
+      "tags": ["operator", "dominance", "adaptation"]
+    },
+    {
+      "id": "DT-SL-085",
+      "category": "Trend Logic",
+      "name": "Trend = Dominant Operator Holding",
+      "condition": "Trend continues with clean continuation and no exit signatures.",
+      "interpretation": "Trend persists while the dominant operator holds positions.",
+      "action": "Stay with the trend; reduce counter-trend attempts unless exit signals or strong invalidation appears.",
+      "tags": ["operator", "trend", "hold_logic"]
+    },
+    {
+      "id": "DT-SL-086",
+      "category": "Exit Detection",
+      "name": "Operator Exit Pattern",
+      "condition": "After a strong move, price shifts into slow grind, small pullbacks, reduced follow-through, and choppy progress.",
+      "interpretation": "Operator may be booking profits / distributing.",
+      "action": "Tighten stops, take partial profits, avoid fresh late entries, and wait for next confirmation.",
+      "tags": ["operator_exit", "profit_booking", "management"]
+    },
+    {
+      "id": "DT-SL-087",
+      "category": "Reversal Signal",
+      "name": "Post-Exit Reversal Expectation",
+      "condition": "Operator exit pattern is detected and price stops progressing.",
+      "interpretation": "After exit, reversal probability increases.",
+      "action": "Do not reverse immediately; wait for reversal confirmation (reclaim failure, acceptance, or structure shift).",
+      "tags": ["reversal", "operator_exit", "confirmation"]
+    },
+    {
+      "id": "DT-SL-088",
+      "category": "Trade Management",
+      "name": "Hold With Operator Until Exit",
+      "condition": "In a trade aligned with operator dominance and trend continuation.",
+      "interpretation": "Best profits often come from staying with the operator, not micromanaging.",
+      "action": "Hold while continuation persists; manage using exit signatures (DT-SL-086/093) and invalidation levels.",
+      "tags": ["trade_management", "operator", "trend_follow"]
+    },
+    {
+      "id": "DT-SL-089",
+      "category": "Trap Logic",
+      "name": "Operator Trap Support/Resistance",
+      "condition": "Operator selling is suspected while price hovers at an apparent support (or buying at an apparent resistance).",
+      "interpretation": "The visible level can become a trap; the market may break after building participants.",
+      "action": "Avoid trusting support/resistance blindly; require confirmation and check for liquidity creation behavior.",
+      "tags": ["trap", "operator", "levels"]
+    },
+    {
+      "id": "DT-SL-090",
+      "category": "Special Condition",
+      "name": "Expiry Day Behavior",
+      "condition": "Index/options expiry day or adjacent sessions.",
+      "interpretation": "Forced exits and positioning effects can distort normal SL/structure behavior; next-day behavior may reverse.",
+      "action": "Reduce risk and avoid strong assumptions; prioritize confirmation and consider stopping early if volatility is abnormal.",
+      "tags": ["expiry", "special_day", "risk_reduction"]
+    },
+    {
+      "id": "DT-SL-091",
+      "category": "Time Intelligence",
+      "name": "Event Timing Edge (Expiry/Holidays/Major Events)",
+      "condition": "Low participation windows (holidays) or major event risk (news/global factors).",
+      "interpretation": "Operators can exploit low participation; behavior can become non-standard.",
+      "action": "Classify the day type early; reduce size, tighten limits, or avoid trading if event-driven.",
+      "tags": ["time_intelligence", "event_risk", "participation"]
+    },
+    {
+      "id": "DT-SL-092",
+      "category": "Exit Confirmation",
+      "name": "Delayed Exit Validation",
+      "condition": "You suspect operator exit but confirmation is unclear intraday.",
+      "interpretation": "Exit is often confirmed only after the next reaction (sometimes next session).",
+      "action": "Avoid aggressive reversal trades without confirmation; use conservative management and wait for structure shift.",
+      "tags": ["operator_exit", "confirmation", "patience"]
+    },
+    {
+      "id": "DT-SL-093",
+      "category": "Momentum Interpretation",
+      "name": "Exit vs Continuation Read",
+      "condition": "Comparing strong impulse behavior vs choppy incremental behavior after a move.",
+      "interpretation": "Strong move with minimal pullback suggests holding; choppy micro-moves suggest exit/distribution.",
+      "action": "If holding signatures: stay with trend. If exit signatures: tighten stops/scale out and stop chasing.",
+      "tags": ["momentum", "operator", "management"]
+    },
+    {
+      "id": "DT-SL-094",
+      "category": "SL Hunting Validity",
+      "name": "SL Hunting Effectiveness Filter",
+      "condition": "Before applying SL-hunting logic for a trade idea.",
+      "interpretation": "SL hunting is not universal; effectiveness depends on participation and liquidity availability.",
+      "action": "Proceed only if fresh participants are entering AND SL clusters are available AND the day is not strongly event-driven.",
+      "tags": ["sl_hunting", "validity_filter", "participation"]
+    },
+    {
+      "id": "DT-SL-095",
+      "category": "Liquidity Filter",
+      "name": "Don't Target Deeply Profitable Traders",
+      "condition": "A large portion of participants are already in significant profit.",
+      "interpretation": "Profitable traders often exit manually; SL liquidity may not exist where you expect.",
+      "action": "Avoid building targets purely around their assumed SLs; wait for new liquidity creation or different structure.",
+      "tags": ["profit_distribution", "liquidity", "avoid_false_targets"]
+    },
+    {
+      "id": "DT-SL-096",
+      "category": "Participation Logic",
+      "name": "Retail Participation Requirement",
+      "condition": "Low retail participation / fear-driven avoidance / no fresh entries.",
+      "interpretation": "Without fresh retail positions, SL hunting has weaker fuel.",
+      "action": "Reduce SL-hunting reliance; switch to operator + confirmation model or reduce trading frequency.",
+      "tags": ["participation", "sl_hunting", "filters"]
+    },
+    {
+      "id": "DT-SL-097",
+      "category": "Psychology Override",
+      "name": "Psychology Can Override Chart",
+      "condition": "Chart/levels suggest reversal but behavior/flow indicates continuation (or vice versa).",
+      "interpretation": "In certain conditions, psychology/positioning dominates static chart logic.",
+      "action": "Weight psychology + operator intent higher than static pattern expectations; demand stronger confirmation before fading.",
+      "tags": ["psychology", "operator", "avoid_naive_reversal"]
+    },
+    {
+      "id": "DT-SL-098",
+      "category": "Cross-Market Behavior",
+      "name": "Lagging Market Trap",
+      "condition": "One index has moved strongly while another lags; retail shifts to the laggard expecting catch-up.",
+      "interpretation": "Operators can trap participants in the lagging market.",
+      "action": "Be cautious with laggard breakouts; require multi-index confirmation (DT-SL-077) and strong acceptance before entry.",
+      "tags": ["cross_market", "trap", "confirmation"]
+    },
+    {
+      "id": "DT-SL-099",
+      "category": "Momentum Analysis",
+      "name": "Non-SL Momentum Exists",
+      "condition": "Strong one-way movement occurs without an obvious SL structure trigger.",
+      "interpretation": "Move can be event/capital-flow driven rather than SL cascade.",
+      "action": "Stop forcing an SL narrative; treat as momentum/flow day, reduce counter-trend attempts, and prioritize confirmation.",
+      "tags": ["momentum", "event_flow", "avoid_forced_story"]
+    },
+    {
+      "id": "DT-SL-100",
+      "category": "Market Type",
+      "name": "Event-Driven Market Override",
+      "condition": "Major news, global events, or scheduled high-impact events dominate market behavior.",
+      "interpretation": "Event days can invalidate typical SL-hunting and structure expectations.",
+      "action": "Reduce size or avoid trading; if trading, require strict confirmation and tighter daily loss limits.",
+      "tags": ["event_driven", "risk_reduction", "day_type"]
+    },
+    {
+      "id": "DT-SL-101",
+      "category": "Capital Awareness",
+      "name": "Profit Distribution Mapping",
+      "condition": "Before selecting targets and applying SL-hunting logic.",
+      "interpretation": "Knowing who is in profit vs loss changes liquidity expectations.",
+      "action": "Map likely profit-holders vs trapped participants; use it to adjust SL targets and validity checks.",
+      "tags": ["profit_distribution", "liquidity_mapping", "context"]
+    },
+    {
+      "id": "DT-SL-102",
+      "category": "Risk Control",
+      "name": "70-30 Discipline Rule",
+      "condition": "Recognizing that the model can fail in a meaningful minority of sessions.",
+      "interpretation": "Overtrading the uncertainty zone causes most drawdowns.",
+      "action": "Accept uncertainty; cut frequency, enforce attempt limits, and stop early on mismatch signals (DT-SL-049).",
+      "tags": ["discipline", "drawdown_control", "overtrading_prevention"]
+    },
+    {
+      "id": "DT-SL-103",
+      "category": "Comfort Engine",
+      "name": "Comfort Rule (Crowd Comfort -> Opposite Move Risk)",
+      "condition": "Multiple confirmations align (obvious breakout, indicator agreement, sector/index alignment) and crowd participation increases near the same direction.",
+      "interpretation": "High comfort zones attract maximum crowd entries and build dense SL pools; reversal/trap probability increases.",
+      "action": "Do not chase the comfortable direction. Wait for comfort confirmation and then trade only with strict confirmation (often contrarian or post-trap).",
+      "tags": ["comfort", "crowd", "trap_detection", "contrarian"]
+    },
+    {
+      "id": "DT-SL-104",
+      "category": "Comfort Engine",
+      "name": "Comfort Cluster Formation",
+      "condition": "Index + heavyweight stocks (or multiple correlated instruments) show the same visible breakout/breakdown at the same time.",
+      "interpretation": "A comfort cluster forms; crowd enters together, creating strong liquidity pools and trap potential.",
+      "action": "Mark the cluster zone as a high-probability liquidity/trap area; reduce impulse entries and wait for rejection/failed break or post-sweep reclaim.",
+      "tags": ["comfort", "correlation", "liquidity", "trap"]
+    },
+    {
+      "id": "DT-SL-105",
+      "category": "Comfort Engine",
+      "name": "Comfort Timing (Don't Enter Before Comfort)",
+      "condition": "A setup direction is identified but crowd comfort has not formed yet (participation still hesitant).",
+      "interpretation": "Entering too early often causes stop-out even when the direction is correct.",
+      "action": "Wait for the comfort event (obvious breakout / alignment / crowd entry) and then look for trap confirmation before entry.",
+      "tags": ["comfort", "timing", "avoid_early_entry"]
+    },
+    {
+      "id": "DT-SL-106",
+      "category": "Entry Timing",
+      "name": "Late (Confirmed) Entry Advantage After Comfort",
+      "condition": "Comfort is confirmed and the market shows a trap signature (failed break, rejection, sweep + reclaim).",
+      "interpretation": "Best entries often come after the crowd commits, not during prediction.",
+      "action": "Prefer confirmed entries after the comfort event even if RR is smaller; use partial entry scaling (DT-SL-080).",
+      "tags": ["comfort", "confirmation", "execution"]
+    },
+    {
+      "id": "DT-SL-107",
+      "category": "Liquidity Logic",
+      "name": "Comfort Zones Create SL Pools",
+      "condition": "Comfort cluster forms near a level and price stalls/hesitates.",
+      "interpretation": "New positions create fresh SL pools around the comfort level.",
+      "action": "Treat comfort zones as likely SL clusters; integrate with SL mapping (old/new/profit-holder liquidity).",
+      "tags": ["comfort", "sl_clusters", "new_liquidity"]
+    },
+    {
+      "id": "DT-SL-108",
+      "category": "Cross-Asset Comfort",
+      "name": "Multi-Instrument Comfort Alignment",
+      "condition": "Comfort signals align across index + key constituents + related index (e.g., NIFTY + BANKNIFTY).",
+      "interpretation": "Comfort intensity increases; traps can be sharper and reversals faster.",
+      "action": "Increase trap vigilance; require stronger confirmation for trend-chasing and prefer post-trap entries.",
+      "tags": ["comfort", "correlation", "indices", "risk_filter"]
+    },
+    {
+      "id": "DT-SL-109",
+      "category": "Execution Error",
+      "name": "Early Entry Failure Despite Correct Idea",
+      "condition": "You entered before comfort confirmation and got stopped out, then the market moved in your intended direction.",
+      "interpretation": "Entry timing was wrong, not necessarily the idea.",
+      "action": "Do not revenge trade. Re-enter only after comfort + confirmation and within attempt limits (DT-SL-039).",
+      "tags": ["timing", "discipline", "reentry"]
+    },
+    {
+      "id": "DT-SL-110",
+      "category": "Comfort Engine",
+      "name": "No SL != No Move (Comfort Creation First)",
+      "condition": "After a strong sell/buy, visible SL pools appear absent in the opposite direction.",
+      "interpretation": "Market may still move opposite temporarily to create comfort/fresh participants, then reverse into the true direction.",
+      "action": "Do not assume 'no SL means no move'. Watch for comfort creation + trap confirmation before committing.",
+      "tags": ["comfort", "liquidity_creation", "path_uncertainty"]
+    },
+    {
+      "id": "DT-SL-111",
+      "category": "Trade Management",
+      "name": "Early Profit Exit (Don't Aim Perfection)",
+      "condition": "Trade moves in your favor and reaches a reasonable objective or shows exit/distribution signatures.",
+      "interpretation": "Unbooked profit often turns into loss during reversals/traps.",
+      "action": "Book partial/full profits when available; avoid waiting for perfect targets if structure shows stalling or operator exit (DT-SL-086).",
+      "tags": ["take_profit", "management", "reduce_giveback"]
+    },
+    {
+      "id": "DT-SL-112",
+      "category": "Next-Day Bias Engine",
+      "name": "SL-Based Continuation Bias",
+      "condition": "One side entered heavily, got swept/stopped, and the next session opens with a confirming gap in the same direction as the dominant move.",
+      "interpretation": "Stops provide fuel and continuation becomes more likely when the next open confirms dominance.",
+      "action": "Build a continuation hypothesis for next day; still require opening confirmation (gap + first candle) and validity filters.",
+      "tags": ["next_day_bias", "sl_hunting", "continuation"]
+    },
+    {
+      "id": "DT-SL-113",
+      "category": "Analysis Framework",
+      "name": "Dual Scenario Analysis (Buyers vs Sellers)",
+      "condition": "Before committing to a bias around a key level/zone.",
+      "interpretation": "Both sides can be trapped; one-sided thinking increases errors.",
+      "action": "Always model two scenarios: buyer-trap case and seller-trap case, then let opening/behavior confirm which is active.",
+      "tags": ["scenario_planning", "plan_a_plan_b", "avoid_bias"]
+    },
+    {
+      "id": "DT-SL-114",
+      "category": "Trend Logic",
+      "name": "Time Count Is Not a Reversal Signal",
+      "condition": "Bias is formed mainly because the market moved up/down for multiple days.",
+      "interpretation": "Days count does not imply reversal; continuation depends on who exited/trapped and operator holding.",
+      "action": "Do not fade trend solely due to time count. Require exit/invalidations and confirmation.",
+      "tags": ["trend", "avoid_naive_mean_reversion", "confirmation"]
+    },
+    {
+      "id": "DT-SL-115",
+      "category": "Exit Detection",
+      "name": "Seller Exhaustion / Exit Detection",
+      "condition": "Strong down move followed by sharp retracement that invalidates easy continuation.",
+      "interpretation": "Sellers may have exited or become trapped; target may shift to buyers.",
+      "action": "Reduce bearish conviction, look for structure shift/reclaim, and reassess targets using DT-SL-116.",
+      "tags": ["seller_exit", "trap", "target_shift"]
+    },
+    {
+      "id": "DT-SL-116",
+      "category": "Targeting Logic",
+      "name": "Next Target Shift (After One Side Exits)",
+      "condition": "Evidence suggests one side has exited/been exhausted (e.g., seller exhaustion or buyer exhaustion).",
+      "interpretation": "Liquidity target often shifts to the opposite side.",
+      "action": "Update liquidity map and aim next targets toward the opposite side's SL pools (with confirmation).",
+      "tags": ["liquidity_targets", "target_shift", "sl_hunting"]
+    },
+    {
+      "id": "DT-SL-117",
+      "category": "Participation Filter",
+      "name": "Fear-Based Non-Participation",
+      "condition": "Market moves fast/erratic and participants hesitate; fresh entries are scarce.",
+      "interpretation": "Less fresh SL is created; SL hunting becomes less reliable.",
+      "action": "Reduce frequency/size and favor confirmation-based momentum/operator reads over SL targeting.",
+      "tags": ["participation", "validity_filter", "fear"]
+    },
+    {
+      "id": "DT-SL-118",
+      "category": "Psychology Engine",
+      "name": "Emotion Behind Candles",
+      "condition": "Reading candle sequences around key levels (strong impulse, hesitation, repeated rejection).",
+      "interpretation": "Candles reflect fear/greed/hesitation; emotion shifts often precede traps and reversals.",
+      "action": "Use emotion cues as a filter: hesitation near comfort levels increases trap probability; strong acceptance reduces it.",
+      "tags": ["psychology", "emotion", "trap_detection"]
+    },
+    {
+      "id": "DT-SL-119",
+      "category": "Entry Logic",
+      "name": "Retracement Requirement for Liquidity Creation",
+      "condition": "A target requires fresh participants/SL to be created before a clean move is likely.",
+      "interpretation": "Market may retrace first to build comfort and liquidity.",
+      "action": "Prefer entries after retracement + confirmation rather than chasing the initial impulse.",
+      "tags": ["retracement", "liquidity_creation", "entry_timing"]
+    },
+    {
+      "id": "DT-SL-120",
+      "category": "Multi-Index Logic",
+      "name": "Index Behavior Difference (Analyze Separately)",
+      "condition": "Comparing signals between indices (e.g., NIFTY vs BANKNIFTY).",
+      "interpretation": "Different indices can have different phases (range vs trend) simultaneously.",
+      "action": "Analyze each index independently for structure/phase; use correlation as confirmation, not as substitution.",
+      "tags": ["indices", "phase_detection", "confirmation"]
+    },
+    {
+      "id": "DT-SL-121",
+      "category": "Chart Execution Engine",
+      "name": "Timeframe Alignment (Execution vs Confirmation)",
+      "condition": "Selecting timeframes for signal generation and execution.",
+      "interpretation": "Lower TF shows micro traps and precise SL hits; higher TF reduces noise and improves confirmation clarity.",
+      "action": "Use 1-min for execution precision and microstructure; use 5-min/15-min for trend/confirmation and hypothesis framing.",
+      "tags": ["timeframe", "execution", "confirmation"]
+    },
+    {
+      "id": "DT-SL-122",
+      "category": "SL Hunting Logic",
+      "name": "Price Reaction Over Candle Close",
+      "condition": "Evaluating SL hunts and traps around breaks/sweeps.",
+      "interpretation": "Micro reaction (sweep + snapback) can matter more than candle close on higher TF.",
+      "action": "In SL hunting, prioritize price reaction and immediate reclaim behavior; do not rely only on higher-TF candle closes.",
+      "tags": ["sl_hunting", "microstructure", "reaction"]
+    },
+    {
+      "id": "DT-SL-123",
+      "category": "Structure Visibility",
+      "name": "Micro Structure Visibility Advantage",
+      "condition": "You suspect SL sweeps/traps but higher TF candles hide the sequence.",
+      "interpretation": "Lower TF can reveal the exact sweep, reclaim, and trap sequence.",
+      "action": "Drop to 1-min to validate SL sweep/reclaim; only then execute with risk controls.",
+      "tags": ["microstructure", "confirmation", "execution"]
+    },
+    {
+      "id": "DT-SL-124",
+      "category": "Market Type",
+      "name": "Range + Gap Strategy",
+      "condition": "Market is sideways/ranging on higher TF and opens with a gap.",
+      "interpretation": "In ranges, gaps often fade into range logic more cleanly than in trends.",
+      "action": "If ranging: gap up favors longs (buy dips); gap down favors shorts (sell bounces) after confirmation.",
+      "tags": ["range", "gap_logic", "strategy_selection"]
+    },
+    {
+      "id": "DT-SL-125",
+      "category": "Trend Behavior",
+      "name": "Trap Before Continuation (Trend + Gap)",
+      "condition": "A trend exists on higher TF and the market opens with a gap.",
+      "interpretation": "In trends, the first move after open can trap the wrong side before continuation resumes.",
+      "action": "In uptrend: expect early drop/trap before continuation. In downtrend: expect early rise/trap before continuation. Trade only after confirmation (DT-SL-073).",
+      "tags": ["trend", "gap", "morning_trap"]
+    },
+    {
+      "id": "DT-SL-126",
+      "category": "Execution Timing",
+      "name": "Morning Trap Capture",
+      "condition": "First significant move after open conflicts with higher-TF trend or comfort logic.",
+      "interpretation": "First move can be trap/liq-creation rather than true direction.",
+      "action": "Avoid impulse entry on first move; wait for trap confirmation (failed break / reclaim) and then execute.",
+      "tags": ["open", "trap", "timing"]
+    },
+    {
+      "id": "DT-SL-127",
+      "category": "Options Insight",
+      "name": "Trend-Based Option Side Bias (Secondary)",
+      "condition": "Using options intraday with an identified higher-TF trend.",
+      "interpretation": "Opposite-side options can be used during early trap moves (e.g., in uptrend, early drop may reward puts).",
+      "action": "Treat as secondary execution insight only; do not override price confirmation and risk controls.",
+      "tags": ["options", "secondary_signal", "execution"]
+    },
+    {
+      "id": "DT-SL-128",
+      "category": "Volatility Logic",
+      "name": "Gap Size Behavior",
+      "condition": "Gap size is large vs small relative to recent volatility.",
+      "interpretation": "Large gaps increase two-sided volatility and trap risk; small gaps can be cleaner.",
+      "action": "On large gaps, reduce size and require more confirmation; on small gaps, still follow the opening matrix and confirmation rules.",
+      "tags": ["gap", "volatility", "risk_filter"]
+    },
+    {
+      "id": "DT-SL-129",
+      "category": "Strategy Selection",
+      "name": "No Trend Mode (Follow Flow, Avoid Prediction)",
+      "condition": "Higher TF has no clear structure/trend (range/transition).",
+      "interpretation": "Prediction quality drops; traps increase.",
+      "action": "Follow confirmed flow and microstructure; reduce frequency and avoid strong directional predictions.",
+      "tags": ["no_trend", "flow", "risk_reduction"]
+    },
+    {
+      "id": "DT-SL-130",
+      "category": "Execution Discipline",
+      "name": "Timeframe Confidence Rule",
+      "condition": "You are tempted to trade on a timeframe you are not trained to execute reliably.",
+      "interpretation": "Mismatch between skill and timeframe increases execution errors.",
+      "action": "Trade only on trained timeframes; if unsure, step up to confirmation TF and wait.",
+      "tags": ["discipline", "timeframe", "avoid_errors"]
+    },
+    {
+      "id": "DT-SL-131",
+      "category": "Planning",
+      "name": "Pre-Market Structure Planning (Timeframe + Gap Expectation)",
+      "condition": "Before session open.",
+      "interpretation": "Clear planning improves execution and reduces impulsive decisions.",
+      "action": "Plan using higher TF structure, key levels, and gap scenarios; execute on 1-min only after confirmation.",
+      "tags": ["premarket", "planning", "execution"]
+    },
+    {
+      "id": "DT-SL-132",
+      "category": "Market Type",
+      "name": "No-Pullback Trend Day",
+      "condition": "After open, price shows strong directional move with successive lower highs (bearish) or higher lows (bullish) and no meaningful retracement to prior key levels.",
+      "interpretation": "Some days are direct momentum days; waiting for an ideal pullback can miss the best move.",
+      "action": "Trade continuation via breakdown/breakout acceptance or micro pullbacks only; reduce counter-trend attempts and focus on confirmation (DT-SL-073).",
+      "tags": ["trend_day", "momentum", "execution"]
+    },
+    {
+      "id": "DT-SL-133",
+      "category": "Thinking Engine",
+      "name": "WHY-Based Analysis",
+      "condition": "You observe a significant move (breakout, breakdown, impulse candle, sudden reversal).",
+      "interpretation": "Price movement is driven by behavior: SL hit, exits/profit booking, fresh entry, or operator push.",
+      "action": "Before trading, answer 'why did this move happen?' and choose the most plausible driver using evidence (liquidity map, comfort, operator signatures, volatility).",
+      "tags": ["why_engine", "thinking", "reduce_bias"]
+    },
+    {
+      "id": "DT-SL-134",
+      "category": "Momentum Analysis",
+      "name": "Exit-Based Movement (Profit Booking / Forced Exit)",
+      "condition": "After a strong move, price reverses without clear new-entry signals, often around holidays/events or after long continuation.",
+      "interpretation": "Moves can be driven by exits (profit booking or forced exit) rather than fresh entries.",
+      "action": "Do not assume reversal = new trend. Manage positions proactively (DT-SL-111) and demand confirmation before flipping bias (DT-DOW-003).",
+      "tags": ["profit_booking", "forced_exit", "management"]
+    },
+    {
+      "id": "DT-SL-135",
+      "category": "Thinking Engine",
+      "name": "Multi-Possibility Thinking",
+      "condition": "A setup appears around a key level/zone.",
+      "interpretation": "Multiple drivers can explain the same candle; single-story thinking causes bias.",
+      "action": "Generate 3-4 plausible drivers (SL hit, profit booking, fresh entry, operator push). Trade only after evidence supports one scenario and invalidates others.",
+      "tags": ["scenario_thinking", "avoid_single_story", "discipline"]
+    },
+    {
+      "id": "DT-SL-136",
+      "category": "Psychology",
+      "name": "Breakdown Psychology (Forced Exit 'Himmat Tutna')",
+      "condition": "Participants hold losing positions for long, then a sudden acceleration occurs through a level with minimal bounce.",
+      "interpretation": "Forced exits can create sharp momentum and SL cascades.",
+      "action": "Avoid fading the acceleration. If aligned with structure/liquidity, trade with momentum after confirmation; if trapped, exit quickly.",
+      "tags": ["forced_exit", "momentum", "psychology"]
+    },
+    {
+      "id": "DT-SL-137",
+      "category": "Momentum Analysis",
+      "name": "Momentum Source Classification",
+      "condition": "Any strong directional move occurs.",
+      "interpretation": "Not all momentum is SL-driven; classifying the source improves targeting and risk.",
+      "action": "Classify the move as one of: (1) SL hit/cascade, (2) profit booking/exits, (3) fresh entry breakout, (4) operator push/event-flow. Adjust tactics accordingly.",
+      "tags": ["momentum", "classification", "why_engine"]
+    },
+    {
+      "id": "DT-SL-138",
+      "category": "Execution Psychology",
+      "name": "Trap Before Big Move (Reinforced)",
+      "condition": "Price approaches a key level with rising comfort/participation and then shows hesitation or repeated failures.",
+      "interpretation": "Large moves often require liquidity creation; traps can occur before the real move.",
+      "action": "Avoid early entries into comfort. Wait for trap confirmation (failed break, sweep + reclaim) before committing.",
+      "tags": ["trap", "comfort", "patience"]
+    },
+    {
+      "id": "DT-SL-139",
+      "category": "Thinking Engine",
+      "name": "Expand Thinking Range",
+      "condition": "You can explain a move with only 1-2 obvious reasons (e.g., 'support' or 'resistance').",
+      "interpretation": "Shallow explanations increase mistake frequency in complex sessions.",
+      "action": "Expand to behavior-based reasons (who is trapped, who exited, what comfort formed, what liquidity was created) before acting.",
+      "tags": ["thinking", "depth", "reduce_errors"]
+    },
+    {
+      "id": "DT-SL-140",
+      "category": "Zone Engine",
+      "name": "Trading Zone Classification (Discount / Fair / Inflated)",
+      "condition": "Before taking a trade, determine price context relative to recent value and extremes.",
+      "interpretation": "Edge is higher at extremes (discount/inflated) and lower at fair price.",
+      "action": "Classify the current location into: discount (cheap), fair (balanced), inflated (expensive). Use MATRIX-ZONE-001 posture rules.",
+      "tags": ["zone_engine", "context", "overtrading_prevention"]
+    },
+    {
+      "id": "DT-SL-141",
+      "category": "Risk Filter",
+      "name": "Fair Price Avoidance",
+      "condition": "Zone is classified as fair (balanced) and no strong confluence exists.",
+      "interpretation": "Fair price has low edge and high chop; fake moves increase.",
+      "action": "Avoid trading by default. Only trade if strong confluence exists (liquidity + confirmation + operator/comfort evidence).",
+      "tags": ["zone_engine", "avoid_chop", "risk_filter"]
+    },
+    {
+      "id": "DT-SL-142",
+      "category": "Entry Logic",
+      "name": "Zone-Based Entry Alignment",
+      "condition": "A setup is identified (reclaim, break, SL hunt, comfort).",
+      "interpretation": "Setups work best when aligned with extreme zones.",
+      "action": "Prioritize trades when zone is discount or inflated. Deprioritize or skip similar setups in fair zone.",
+      "tags": ["zone_engine", "entry_filter", "probability"]
+    },
+    {
+      "id": "DT-SL-143",
+      "category": "Liquidity + Zone",
+      "name": "SL + Extreme Zone Confluence",
+      "condition": "A clear SL cluster exists and zone is discount or inflated.",
+      "interpretation": "Liquidity behavior becomes more exploitable at extremes; traps/continuations are cleaner.",
+      "action": "Increase setup priority when SL clusters align with discount/inflated zones, still requiring confirmation (DT-SL-073).",
+      "tags": ["sl_hunting", "zone_engine", "confluence"]
+    },
+    {
+      "id": "DT-SL-144",
+      "category": "Tool Integration",
+      "name": "Volume Profile for Fair-Price Detection (Optional)",
+      "condition": "Volume profile / VWAP / high-volume node data is available.",
+      "interpretation": "Fair price is often near value area / high-volume nodes where two-way trade dominates.",
+      "action": "Use volume profile/VWAP to approximate fair zone. If price is inside value, treat as fair and reduce trading frequency.",
+      "tags": ["volume_profile", "vwap", "zone_engine"]
+    },
+    {
+      "id": "DT-SL-145",
+      "category": "Gap Logic",
+      "name": "Gap-to-Zone Behavior",
+      "condition": "Market opens with a gap that lands into discount/fair/inflated zone.",
+      "interpretation": "Gap location influences edge and trap probability.",
+      "action": "Gap into discount: prefer longs after confirmation. Gap into inflated: expect comfort/trap or continuation based on operator holding. Gap into fair: avoid by default.",
+      "tags": ["gap", "zone_engine", "opening_filter"]
+    },
+    {
+      "id": "DT-SL-146",
+      "category": "Risk Management",
+      "name": "Zone-Based Risk Posture",
+      "condition": "Zone is classified (discount/fair/inflated).",
+      "interpretation": "Risk differs by zone due to edge and chop probability.",
+      "action": "Discount: allow slightly more aggressive posture. Inflated: trade cautiously and prefer confirmation. Fair: avoid or trade minimal size.",
+      "tags": ["zone_engine", "risk", "position_sizing"]
+    },
+    {
+      "id": "DT-SL-147",
+      "category": "Execution Logic",
+      "name": "Plan vs Reality (Abandon Plan on Mismatch)",
+      "condition": "You prepared a pre-market plan (gap up/down/flat scenarios) but the opening behavior contradicts it.",
+      "interpretation": "The plan is a hypothesis; reality overrides hypothesis.",
+      "action": "Abandon the plan immediately and switch to observation + rebuild mode (aligns with DT-SL-071/028).",
+      "tags": ["adaptation", "plan_vs_reality", "discipline"]
+    },
+    {
+      "id": "DT-SL-148",
+      "category": "Opening Discipline",
+      "name": "No Trade on Unclear Open (Wait 10-20 minutes)",
+      "condition": "Opening is unexpectedly volatile, contradicts hypothesis, or shows unstable whipsaw patterns.",
+      "interpretation": "Early uncertainty increases trap probability and forced errors.",
+      "action": "Wait 10-20 minutes, let structure form, then trade only after confirmation and zone alignment.",
+      "tags": ["opening", "patience", "avoid_noise"]
+    },
+    {
+      "id": "DT-SL-149",
+      "category": "Opportunity Logic",
+      "name": "Second Opportunity Engine",
+      "condition": "First setup fails or is missed, and the market builds a new structure later.",
+      "interpretation": "Professionals wait for the next clean opportunity rather than forcing the first idea.",
+      "action": "Reset, rebuild hypothesis, and trade the next confirmed setup (within attempt limits).",
+      "tags": ["second_chance", "discipline", "avoid_revenge"]
+    },
+    {
+      "id": "DT-SL-150",
+      "category": "Psychology",
+      "name": "Trader Removal (Side Exhaustion)",
+      "condition": "A strong directional move occurs with continued follow-through and minimal counter response.",
+      "interpretation": "One side may be removed/exhausted; next liquidity target can shift.",
+      "action": "After removal, expect retracement traps and target shifts (DT-SL-116/151). Do not assume immediate continuation forever (DT-SL-153).",
+      "tags": ["exhaustion", "target_shift", "psychology"]
+    },
+    {
+      "id": "DT-SL-151",
+      "category": "Trap Logic",
+      "name": "Retracement Trap After Strong Move",
+      "condition": "After a strong impulse, a retracement invites late participants on the opposite side.",
+      "interpretation": "Late entries create fresh SL fuel for the next continuation/reversal.",
+      "action": "Treat the retracement as potential liquidity creation. Enter only after confirmation (failed reclaim, sweep+reclaim, or acceptance).",
+      "tags": ["retracement", "trap", "liquidity_creation"]
+    },
+    {
+      "id": "DT-SL-152",
+      "category": "Multi-Market",
+      "name": "Cross-Index Divergence",
+      "condition": "One index shows strength while another weakens (or lags) during the same window.",
+      "interpretation": "Divergence can signal operator rotation/trap; correlation may not confirm the trade.",
+      "action": "Reduce conviction and size; require stronger confirmation and zone alignment before trading the weaker/lagging index.",
+      "tags": ["divergence", "indices", "confirmation"]
+    },
+    {
+      "id": "DT-SL-153",
+      "category": "Market Logic",
+      "name": "One-Side Market Limitation",
+      "condition": "Only one side is active (only buyers or only sellers) and participation dries up on the opposite side.",
+      "interpretation": "Markets often need two-sided participation to continue; edge reduces when liquidity is absent.",
+      "action": "Expect stall, liquidity creation, or reversal. Reduce aggressive continuation trades and wait for new participation signals.",
+      "tags": ["liquidity", "stall_risk", "validity_filter"]
+    },
+    {
+      "id": "DT-SL-154",
+      "category": "Psychology",
+      "name": "Position Holding Behavior Creates Future Liquidity",
+      "condition": "Participants hold losing trades (or average) instead of exiting quickly.",
+      "interpretation": "Held positions become future forced-exit/SL pools.",
+      "action": "Include held-loss behavior in liquidity map (with profit holders) and anticipate future liquidation moves.",
+      "tags": ["future_liquidity", "held_positions", "psychology"]
+    },
+    {
+      "id": "DT-SL-155",
+      "category": "Learning Engine",
+      "name": "Loss Analysis (Mistake -> Assumption)",
+      "condition": "A stopped-out trade occurs.",
+      "interpretation": "Loss is feedback; the error is often a wrong assumption about driver/zone/liquidity readiness.",
+      "action": "Record which assumption failed (WHY driver, comfort, zone, operator exit, validity) and update filters before re-entry.",
+      "tags": ["review", "learning", "reduce_repeat_errors"]
+    },
+    {
+      "id": "DT-SL-156",
+      "category": "Risk Management",
+      "name": "News Avoidance / Pre-Event Exit",
+      "condition": "Major scheduled news/events are near or event risk is elevated.",
+      "interpretation": "Event volatility can invalidate SL/zone logic and cause random spikes.",
+      "action": "Exit or reduce exposure before events; avoid holding positions through major releases unless explicitly designed for it.",
+      "tags": ["event_risk", "risk_reduction", "avoid_positional"]
+    },
+    {
+      "id": "DT-SL-157",
+      "category": "Flow Engine",
+      "name": "Chart Linking (Move -> Reaction -> Next Move)",
+      "condition": "A notable move occurs (break, impulse, sweep, rejection) and a new local structure forms after it.",
+      "interpretation": "Every move creates new expectations, new comfort, and new SL pools; analyzing candles in isolation misses the next trap.",
+      "action": "After each major move, predict trader reaction (buy dip/sell rally/fade breakout) and map where the next liquidity will form; trade only after confirmation.",
+      "tags": ["flow", "chart_linking", "liquidity_creation"]
+    },
+    {
+      "id": "DT-SL-158",
+      "category": "Psychology",
+      "name": "Continuation Illusion Trap (Overextended != Reversal)",
+      "condition": "Market has moved strongly and the crowd assumes 'it must reverse now'.",
+      "interpretation": "Overextended moves often continue because reversal-thinking creates the next trap/SL pool.",
+      "action": "Do not fade purely because it 'moved a lot'. Require reversal confirmation (operator exit + structure shift + acceptance) before counter-trend trades.",
+      "tags": ["continuation", "avoid_naive_reversal", "trap"]
+    },
+    {
+      "id": "DT-SL-159",
+      "category": "Market Type",
+      "name": "News Behavior (Step Movement)",
+      "condition": "Negative/positive news is active or anticipated and price behavior becomes staged rather than clean trend.",
+      "interpretation": "News-driven markets can form supports/resistances step-by-step before continuing; direct extrapolation is unreliable.",
+      "action": "Reduce aggression, require stronger confirmation, and prioritize risk control (DT-SL-156/100).",
+      "tags": ["news", "event_driven", "risk_filter"]
+    },
+    {
+      "id": "DT-SL-160",
+      "category": "Trend Logic",
+      "name": "Support-Based Downtrend Progression",
+      "condition": "A downtrend is active and price repeatedly creates small supports before breaking them.",
+      "interpretation": "Supports are created to invite dip-buyers and late sellers; breaks create continuation fuel.",
+      "action": "In downtrend, treat repeated support formation as potential trap/continuation steps; sell breakdown acceptance or sell failed reclaim after breaks.",
+      "tags": ["downtrend", "support_break", "flow"]
+    },
+    {
+      "id": "DT-SL-161",
+      "category": "Trend Logic",
+      "name": "Resistance-Based Uptrend Progression",
+      "condition": "An uptrend is active and price repeatedly creates small resistances before breaking them.",
+      "interpretation": "Resistances invite sellers; break + acceptance continues trend and can trigger SL cascades.",
+      "action": "In uptrend, trade break + acceptance or buy pullbacks after confirmation; avoid shorting resistances without exit/shift evidence.",
+      "tags": ["uptrend", "resistance_break", "flow"]
+    },
+    {
+      "id": "DT-SL-162",
+      "category": "Market Logic",
+      "name": "Trap Formation Requires Two-Sided Participation",
+      "condition": "You expect a trap/SL hunt but only one side is active and the other side is absent/scared.",
+      "interpretation": "Traps need both buyers and sellers to create liquidity; one-sided markets often stall or create liquidity first.",
+      "action": "Do not force a trap narrative. Wait for two-sided participation signals or treat as low-quality environment (aligns with DT-SL-153/096).",
+      "tags": ["two_sided", "liquidity", "validity_filter"]
+    },
+    {
+      "id": "DT-SL-163",
+      "category": "Gap Logic",
+      "name": "Large Gap -> New Chart Priority",
+      "condition": "Gap is large relative to recent volatility and opens away from prior structure.",
+      "interpretation": "Old structure may lose relevance; a new intraday structure forms quickly after open.",
+      "action": "Reduce reliance on previous micro-levels; wait for new structure/acceptance in first 10-20 minutes before committing.",
+      "tags": ["gap", "new_structure", "opening_discipline"]
+    },
+    {
+      "id": "DT-SL-164",
+      "category": "Gap Psychology",
+      "name": "Gap Behavior (Pause vs Recovery)",
+      "condition": "Market opens with a gap and the first sequence shows either direct continuation or strong recovery.",
+      "interpretation": "Gap-up often needs pause/sideways/pullback before sustainable continuation; gap-down with strong recovery candle can increase reversal probability.",
+      "action": "Avoid instant entries. Use opening matrix + microstructure confirmation to decide continuation vs reversal.",
+      "tags": ["gap", "psychology", "opening_filter"]
+    },
+    {
+      "id": "DT-SL-165",
+      "category": "Execution",
+      "name": "Partial Capture Rule",
+      "condition": "A move is in progress and you have a confirmed entry.",
+      "interpretation": "Capturing the entire move is unrealistic; late holding increases giveback and trap risk.",
+      "action": "Capture the logical portion (first/clean leg) and manage exits using operator exit signals and structure; avoid aiming for perfect tops/bottoms.",
+      "tags": ["take_profit", "execution", "reduce_giveback"]
+    },
+    {
+      "id": "DT-SL-166",
+      "category": "Discipline",
+      "name": "Overtrading Control (Max 2-3 Trades/Day)",
+      "condition": "You have already taken multiple trades in the session or clarity is degrading.",
+      "interpretation": "More trades often mean more confusion and lower edge; drawdowns come from overtrading.",
+      "action": "Cap at 2-3 trades/day unless the market is exceptionally clean and all filters align. Stop early on mismatch signals (DT-SL-049).",
+      "tags": ["overtrading_prevention", "discipline", "drawdown_control"]
+    },
+    {
+      "id": "DT-SL-167",
+      "category": "Flow Engine",
+      "name": "Reaction Prediction (What Will Traders Do Next?)",
+      "condition": "After a move, you are evaluating whether to continue, reverse, or wait.",
+      "interpretation": "Trader reaction drives the next liquidity pool and trap; anticipating reaction improves timing.",
+      "action": "Ask: what will the crowd do next (buy dip, sell rally, chase breakout)? Map where their SL will sit and wait for confirmation before entry.",
+      "tags": ["reaction", "flow", "comfort"]
+    },
+    {
+      "id": "DT-SL-168",
+      "category": "Probability Engine",
+      "name": "Highest Probability Side Selection",
+      "condition": "Both long and short narratives exist (dual scenario) and you must choose a side.",
+      "interpretation": "The obvious direction is not always the highest probability; probability comes from SL availability + validity + zone + confirmation.",
+      "action": "Trade the side with higher SL availability and clearer liquidity path, after confirmation. If probability is unclear, do not trade.",
+      "tags": ["probability", "selection", "discipline"]
+    },
+    {
+      "id": "DT-SL-169",
+      "category": "Thinking Engine",
+      "name": "Reason-Based Trading (No Reason -> No Trade)",
+      "condition": "You are about to enter based on impulse, FOMO, or pattern without a clear driver.",
+      "interpretation": "Trades without a clear reason are usually comfort-chasing and become liquidity.",
+      "action": "Require a stated reason (WHY driver + SL map + zone + confirmation). If you cannot state it, skip.",
+      "tags": ["why_engine", "discipline", "avoid_impulse"]
+    },
+    {
+      "id": "DT-SL-170",
+      "category": "Liquidity",
+      "name": "SL Availability Rule (No SL -> SL Creation -> Then Move)",
+      "condition": "You expect a strong move but there is no obvious SL liquidity on the target side.",
+      "interpretation": "Market often creates SL first by moving opposite to attract participants, then targets the created SL.",
+      "action": "Wait for SL creation behavior (comfort/late entries) before expecting the real move. Do not force direction early.",
+      "tags": ["sl_availability", "liquidity_creation", "patience"]
+    },
+    {
+      "id": "DT-SL-171",
+      "category": "Liquidity",
+      "name": "SL Creation Phase (First Move Can Be Opposite)",
+      "condition": "Market is stalling and participation is one-sided or low, but a larger move is expected.",
+      "interpretation": "First move can be engineered to create new SL pools; the second move targets them.",
+      "action": "Treat the first engineered move as potential trap/liquidity creation. Enter only after confirmation of the real direction.",
+      "tags": ["sl_creation", "trap_then_real", "flow"]
+    },
+    {
+      "id": "DT-SL-172",
+      "category": "Target Logic",
+      "name": "Target the Weak Side (Losing Traders)",
+      "condition": "Selecting targets for SL hunting.",
+      "interpretation": "Losing/trapped traders provide forced liquidity; deeply profitable traders may exit manually (DT-SL-095).",
+      "action": "Prefer targeting losing/trapped participants and fresh SL pools; deprioritize targets based on assumed SL of large profit holders.",
+      "tags": ["targets", "sl_hunting", "profit_distribution"]
+    },
+    {
+      "id": "DT-SL-173",
+      "category": "Execution",
+      "name": "No Chase Rule (Move Done -> Skip)",
+      "condition": "A big move already happened and you missed the entry.",
+      "interpretation": "Late entries become liquidity and get trapped.",
+      "action": "Skip chasing. Wait for retracement + confirmation or a new setup (DT-SL-079/149).",
+      "tags": ["no_chase", "discipline", "avoid_late_entry"]
+    },
+    {
+      "id": "DT-SL-174",
+      "category": "Trap Logic",
+      "name": "Late Entry Trap (Big Candle Entry = Liquidity)",
+      "condition": "You enter after multiple large candles or at the end of an impulse without pullback/acceptance.",
+      "interpretation": "Late entries often become the next liquidity pool and get reversed on.",
+      "action": "Avoid entries after big candles unless acceptance + continuation is confirmed. Prefer pullback/scale-in with defined risk.",
+      "tags": ["late_entry", "trap", "execution"]
+    },
+    {
+      "id": "DT-SL-175",
+      "category": "Strategy",
+      "name": "Opposite Trade Logic (When SL Alignment Demands It)",
+      "condition": "Chart direction looks obvious but SL/comfort/operator evidence suggests the opposite side is higher probability.",
+      "interpretation": "Markets can move opposite to obvious direction to target comfort-based SL pools.",
+      "action": "Only take opposite trades after strong confirmation (failed break, sweep+reclaim, operator exit) and with reduced size.",
+      "tags": ["contrarian", "comfort", "probability"]
+    },
+    {
+      "id": "DT-SL-176",
+      "category": "Market Behavior",
+      "name": "Overcrowding Filter (All Indices Same Direction)",
+      "condition": "Correlated indices are all moving strongly in the same direction with high comfort.",
+      "interpretation": "Continuation edge can reduce due to overcrowding; retracement/trap probability increases.",
+      "action": "Avoid late continuation entries. Prefer waiting for pullback, trap confirmation, or operator holding evidence before adding risk.",
+      "tags": ["overcrowding", "correlation", "comfort"]
+    },
+    {
+      "id": "DT-SL-177",
+      "category": "Execution",
+      "name": "Early Move Capture (Avoid Late Move)",
+      "condition": "A move is underway and you must decide whether to participate late.",
+      "interpretation": "The best edge is early/clean legs; late legs carry trap risk.",
+      "action": "Participate early after confirmation or skip and wait for next setup. Combine with DT-SL-165 partial capture.",
+      "tags": ["execution", "timing", "risk_filter"]
+    },
+    {
+      "id": "DT-SL-178",
+      "category": "Planning Engine",
+      "name": "Multi-Day Thinking (2-3 Day Expectation)",
+      "condition": "Before session open and when building bias.",
+      "interpretation": "Operators plan multi-day moves; thinking beyond 'tomorrow up/down' improves scenario planning.",
+      "action": "Outline 2-3 day possibilities (direct trend, gap-trap-continue, sideways-then-break). Trade only when day-1 behavior confirms one scenario.",
+      "tags": ["planning", "multi_day", "scenarios"]
+    },
+    {
+      "id": "DT-SL-179",
+      "category": "Operator Logic",
+      "name": "Operator Planning (Multi-Day Movement)",
+      "condition": "Assessing trend continuation vs pause after a strong move.",
+      "interpretation": "Operators often distribute/accumulate across days; immediate repetition of the same pattern is less likely.",
+      "action": "After a strong trend day, expect pause/sideways/trap next; reduce trend-chasing and rely on confirmation.",
+      "tags": ["operator", "multi_day", "expectation"]
+    },
+    {
+      "id": "DT-SL-180",
+      "category": "Pattern Logic",
+      "name": "Non-Repetition Rule (Pattern Won't Repeat Immediately)",
+      "condition": "Market already executed a strong, obvious pattern recently (clean trend/cascade).",
+      "interpretation": "Immediate repetition is less likely; the market often shifts to trap/sideways to create new liquidity.",
+      "action": "Adjust expectations: look for consolidation/traps and require stronger confirmation for continuation.",
+      "tags": ["pattern", "expectation", "liquidity_creation"]
+    },
+    {
+      "id": "DT-SL-181",
+      "category": "Planning Engine",
+      "name": "Scenario Building (Gap Up/Down/Flat)",
+      "condition": "Before session open.",
+      "interpretation": "Scenario planning prevents rigid bias and improves reaction speed.",
+      "action": "Always build 3 scenarios (gap up/down/flat) with invalidation rules and preferred actions; treat plan as hypothesis (DT-SL-147).",
+      "tags": ["planning", "scenarios", "opening"]
+    },
+    {
+      "id": "DT-SL-182",
+      "category": "Analysis",
+      "name": "Dual-Side Thinking (Check Both Sides)",
+      "condition": "Before entering around a key level/zone.",
+      "interpretation": "Both buy-case and sell-case can be valid; ignoring one side increases trap risk.",
+      "action": "Explicitly write both cases (buy and sell), then let live confirmation choose the side (DT-SL-073/168).",
+      "tags": ["dual_scenario", "avoid_bias", "confirmation"]
+    },
+    {
+      "id": "DT-SL-183",
+      "category": "Execution",
+      "name": "Flexible Execution (Plan != Execution)",
+      "condition": "A plan is prepared but live market behavior diverges.",
+      "interpretation": "Profit comes from adapting execution to reality, not from defending a plan.",
+      "action": "Adapt immediately: wait, rebuild, or switch (DT-SL-071/147/148).",
+      "tags": ["adaptation", "execution", "discipline"]
+    },
+    {
+      "id": "DT-SL-184",
+      "category": "Psychology",
+      "name": "Expectation Control (Prepare Possibilities, Not Certainty)",
+      "condition": "You feel certain about one outcome before confirmation.",
+      "interpretation": "Certainty increases bias and overtrading.",
+      "action": "Replace certainty with 3 possibilities and invalidation points; trade only after evidence selects one path.",
+      "tags": ["expectation", "discipline", "planning"]
+    },
+    {
+      "id": "DT-SL-185",
+      "category": "Risk",
+      "name": "Immediate Exit on Failure (No Hope Holding)",
+      "condition": "Your trade thesis invalidates (breaks structure, confirmation fails, operator exit signs appear).",
+      "interpretation": "Hope holding creates large losses and destroys expectancy.",
+      "action": "Exit immediately when invalidated; never convert intraday trades into positional holds.",
+      "tags": ["risk", "discipline", "exit_rule"]
+    },
+    {
+      "id": "DT-SL-186",
+      "category": "Discipline",
+      "name": "Rule-Based Profit (No Random Trades)",
+      "condition": "Considering a trade outside the rulebook filters.",
+      "interpretation": "Random trades remove the edge and increase drawdown.",
+      "action": "If the trade does not pass zone + validity + SL + confirmation + probability selection, do not trade.",
+      "tags": ["discipline", "process", "edge_protection"]
+    },
+    {
+      "id": "DT-SL-187",
+      "category": "Opportunity",
+      "name": "Selective Opportunity Focus",
+      "condition": "Market is choppy or multiple low-quality setups appear.",
+      "interpretation": "Not trading is a position; selective trading preserves capital for high-quality moves.",
+      "action": "Wait for clear setups with confluence; stop trading early if clarity is lost.",
+      "tags": ["selective", "patience", "avoid_chop"]
+    },
+    {
+      "id": "DT-SL-213",
+      "category": "Setup Template (Fixed RR)",
+      "name": "Fixed RR Module (Target 75 / SL 30) - Eligibility Gate",
+      "condition": "You want to execute a fixed R:R intraday setup with Target = 75 points and SL = 30 points.",
+      "interpretation": "Fixed targets only work when (1) the next logical liquidity/structure target is at least 75 points away and (2) the structural invalidation can be expressed within 30 points. Forcing 75/30 in the wrong regime increases stop-outs.",
+      "action": "Use 75/30 only if: (A) zone is discount or inflated (DT-SL-140/141), (B) SL-hunting validity filters pass (DT-SL-094..102), (C) entry is after confirmation (DT-SL-073/190) and the invalidation fits within 30 points WITHOUT widening later (DT-SL-036/041/053). If invalidation requires more than 30, skip or use a different module; do not compress SL into noise.",
+      "tags": ["setup", "fixed_rr", "tp_75", "sl_30", "risk", "discipline"]
+    },
+    {
+      "id": "DT-SL-214",
+      "category": "Setup Template (Fixed RR)",
+      "name": "Sweep + Reclaim Trap Reversal (Target 75 / SL 30)",
+      "condition": "Price sweeps a highly visible level (PDH/PDL/round number/prior swing) and then reclaims with strong acceptance (DT-SL-190), ideally at a zone extreme (DT-SL-140/143).",
+      "interpretation": "The sweep collects clustered stops at the obvious level (DT-SL-194/196). The reclaim + acceptance confirms the trap and increases probability of a move to the next liquidity pool.",
+      "action": "Enter only after strong reclaim/acceptance (DT-SL-190) and 1m reaction confirmation (DT-SL-122/123). Place SL = 30 points beyond the reclaim invalidation (beyond the micro-sweep extreme if it still fits inside 30; otherwise skip the 75/30 module). Set TP = 75 points toward the next mapped liquidity/structure target; do not hold if reclaim fails (DT-SL-185).",
+      "tags": ["setup", "sweep", "reclaim", "trap", "sl_hunting", "fixed_rr", "tp_75", "sl_30"]
+    },
+    {
+      "id": "DT-SL-215",
+      "category": "Setup Template (Fixed RR)",
+      "name": "Accepted Break + Pullback Continuation (Target 75 / SL 30)",
+      "condition": "A key level breaks with strong acceptance (DT-DOW-002 / DT-SL-190), followed by a controlled pullback/hold above (for longs) or below (for shorts). Avoid range-farming conditions (DT-SL-055).",
+      "interpretation": "Acceptance reduces fake-break probability. The pullback creates a clean pivot to express risk tightly without placing SL at the obvious cluster (DT-SL-196).",
+      "action": "Enter on pullback hold only after acceptance is proven (DT-SL-190). Place SL = 30 points beyond the pullback pivot/invalidation (not on the exact level; use buffer logic (DT-SL-196) but keep total SL = 30). Set TP = 75 points toward the next liquidity pool; if price returns and loses acceptance (reclaim failure), exit immediately (DT-SL-185).",
+      "tags": ["setup", "breakout", "acceptance", "pullback", "continuation", "fixed_rr", "tp_75", "sl_30"]
+    },
+    {
+      "id": "DT-SL-216",
+      "category": "Setup Template (Fixed RR)",
+      "name": "Break Failure (Failed Acceptance) Reversal (Target 75 / SL 30)",
+      "condition": "A breakout/breakdown occurs but fails acceptance (DT-DOW-002) and then reclaims back into the prior range with confirmation (DT-SL-190/122).",
+      "interpretation": "Failed acceptance often indicates a liquidity grab and a trap. The reclaim provides the confirmation gate and a clear invalidation point.",
+      "action": "Enter only after failed-acceptance is confirmed and a strong reclaim occurs (DT-SL-190). Place SL = 30 points beyond the failure extreme/pivot (if the logical invalidation is wider than 30, skip the 75/30 module). Set TP = 75 points toward the opposite-side liquidity pool (range edge/PD level).",
+      "tags": ["setup", "failed_break", "trap", "reclaim", "fixed_rr", "tp_75", "sl_30"]
+    },
+    {
+      "id": "DT-SL-217",
+      "category": "Trade Management",
+      "name": "Volatility-Era Profit Booking (Mandatory for Regular Size)",
+      "condition": "Intraday volatility is high (DT-SL-209) or the session repeatedly shows 'profit -> sharp reversal -> stop-out' behavior; you are trading regular size (not tiny learning size).",
+      "interpretation": "In modern whipsaw regimes, waiting for full targets often converts visible profit into loss. Expectancy improves when you lock profit early and reduce exposure to reversal hunts.",
+      "action": "Pre-plan a first profit objective at the nearest logical liquidity/structure level (DT-SL-067/165). On first objective hit: book partial and/or tighten risk (move SL to safer invalidation; never widen). If price becomes choppy near the objective (operator exit signs), exit the remainder (DT-SL-093/185).",
+      "tags": ["profit_booking", "volatility", "whipsaw", "trade_management", "options"]
+    },
+    {
+      "id": "DT-SL-218",
+      "category": "Psychology Control",
+      "name": "Profit->Loss Psychology Trap (Do Not Stare at Profit)",
+      "condition": "You see a trade in profit and start expecting a 'big winner' without fresh liquidity/acceptance evidence; or you delay exit because the target is close.",
+      "interpretation": "Markets often show profit first to anchor greed, then reverse fast to force emotional exits. This is a psychological trap that breaks discipline more than analysis.",
+      "action": "Treat visible profit as a signal to execute your management rules (DT-SL-217/067). If the market fails to continue after a profit window (stall + rejection), take the profit and wait for the next setup (DT-SL-173/149).",
+      "tags": ["psychology", "greed", "giveback", "trap", "discipline"]
+    },
+    {
+      "id": "DT-SL-219",
+      "category": "Execution",
+      "name": "No Direct Buy into Active Selling (Require a Logical Support / Pivot)",
+      "condition": "Buyers are already in profit from a prior up-move and active selling is visible (supply/pressure).",
+      "interpretation": "Buying immediately during active selling is usually prediction. If reversal is real, it will show confirmation at a logical support/pivot (close/VWAP/value edge/swing).",
+      "action": "Do not buy just because price looks cheap. Wait for a logical support/pivot to show acceptance/reclaim (DT-SL-190/073) and then buy. If support does not hold, skip; do not average (DT-SL-041).",
+      "tags": ["execution", "support", "confirmation", "no_falling_knife", "discipline"]
+    },
+    {
+      "id": "DT-SL-220",
+      "category": "Level Engineering",
+      "name": "Previous Close Pivot (Close = First Support/Resistance Candidate)",
+      "condition": "Planning and executing around the prior session close, especially after gap days or high-volatility sessions.",
+      "interpretation": "The close often represents equilibrium/fair value where many participants are anchored. Price frequently reacts there to trap late buyers/sellers or to confirm a real trend shift.",
+      "action": "Mark prior close as a pivot. In gap-down recoveries, reclaiming close with acceptance increases reversal probability. In gap-up failures, losing close increases downside SL-hunt probability. Use it as a confirmation gate; avoid trading the middle around it without clarity (DT-SL-141/208).",
+      "tags": ["close", "pivot", "support_resistance", "equilibrium", "confirmation"]
+    },
+    {
+      "id": "DT-SL-221",
+      "category": "Planning",
+      "name": "Anti-Pattern-Overfit (Market Does Not Repeat Yesterday's Script)",
+      "condition": "You attempt to apply yesterday's exact pattern (e.g., 'yesterday close-resistance caused a drop, so today will do the same').",
+      "interpretation": "Markets rarely replay the same script immediately; psychology shifts after multi-day moves, traps, news, or positioning changes. Overfitting causes repeated stop-outs in the new regime.",
+      "action": "Use yesterday only to map liquidity and anchors (PDH/PDL/close). Build 3 scenarios (gap up/down/flat) and wait for today's confirmation/acceptance before committing (DT-SL-180/181/147).",
+      "tags": ["non_repetition", "planning", "regime_shift", "confirmation", "discipline"]
+    },
+    {
+      "id": "DT-SL-222",
+      "category": "Liquidity Mapping",
+      "name": "Swing High/Low = SL Pool (Intraday Liquidity)",
+      "condition": "A swing high or swing low is confirmed on 1m/5m Dow structure.",
+      "interpretation": "Confirmed swings attract stops: above swing highs sit seller SLs (short stops); below swing lows sit buyer SLs (long stops). These levels are frequent sweep targets and trap pivots, especially when they align with PDH/PDL/round numbers/value edges.",
+      "action": "Always add the last confirmed swing high/low (1m and 5m) to the liquidity map. Prefer trades that target these pools or use sweep+reclaim around them (DT-SL-190/210).",
+      "tags": ["liquidity", "swing", "dow_theory", "sl_pools", "mapping"]
+    },
+    {
+      "id": "DT-SL-223",
+      "category": "Execution",
+      "name": "Swing Reclaim Trigger (Trap Confirmation)",
+      "condition": "Price sweeps beyond a confirmed swing high/low and then reclaims back across it with strong acceptance (DT-SL-190).",
+      "interpretation": "The sweep takes clustered stops at the swing. The reclaim shows failure to accept the break; trapped late traders become fuel for the reversal/continuation leg.",
+      "action": "Enter only after reclaim + acceptance is visible (do not buy/sell on the touch). Place SL beyond the sweep extreme (with buffer) rather than on the swing level (DT-SL-194/196).",
+      "tags": ["execution", "swing", "reclaim", "trap", "confirmation"]
+    },
+    {
+      "id": "DT-SL-224",
+      "category": "Timeframe Alignment",
+      "name": "1m Execution, 5m Swing Confirmation Gate",
+      "condition": "A 1m setup appears around a swing but 5m structure is not aligned/confirmed.",
+      "interpretation": "Many 1m swings are noise; 5m swings represent higher-quality liquidity pools and reduce whipsaw entries.",
+      "action": "Use 1m for entry precision, but require 5m confirmation for higher confidence: prefer trades where 1m reclaim aligns with 5m swing context or where 5m structure is not contradicting the entry (DT-DOW-003). If 5m is unclear, reduce size or WAIT (DT-SL-148/209).",
+      "tags": ["timeframe", "1m", "5m", "confirmation", "dow_theory"]
+    },
+    {
+      "id": "DT-SL-225",
+      "category": "Risk Management",
+      "name": "Swing-Stop Placement (Avoid Exact Swing Levels)",
+      "condition": "Placing SL near a recent swing high/low or round number.",
+      "interpretation": "Stops cluster exactly at swings; micro-sweeps commonly pierce the swing by a few points before moving in the intended direction.",
+      "action": "Do not place SL exactly on the swing. Place SL beyond the micro-sweep buffer (DT-SL-196). If that makes SL too wide, skip the trade or reduce size; never widen after entry (DT-SL-041/053).",
+      "tags": ["risk", "stop_loss", "swing", "micro_sweep", "buffer"]
+    }
+  ],
+  "integration_conflicts": [
+    {
+      "id": "CONFLICT-001",
+      "topic": "Reclaim vs Opening Candle Logic",
+      "note": "Opening candle is a pre-filter and context engine; reclaim/structure-based entries remain primary. If opening candle signals 'trap/volatile', prioritize avoiding trades even if micro-reclaims appear."
+    },
+    {
+      "id": "CONFLICT-002",
+      "topic": "Static vs Directional Levels",
+      "note": "PDH/PDL/round numbers remain important, but how they are treated (support vs resistance) must align with directional bias."
+    },
+    {
+      "id": "CONFLICT-003",
+      "topic": "Premarket Hypothesis vs Live Switching",
+      "note": "Premarket analysis produces a hypothesis, not a commitment. Live confirmation can veto the hypothesis and trigger DT-SL-071 dynamic plan switching."
+    },
+    {
+      "id": "CONFLICT-004",
+      "topic": "SL Hunting vs Event/Flow Days",
+      "note": "On event-driven or flow-dominant sessions (DT-SL-099/100), SL-hunting targets can be unreliable; trade smaller or avoid and prioritize confirmation."
+    },
+    {
+      "id": "CONFLICT-005",
+      "topic": "Comfort Engine vs Momentum Continuation",
+      "note": "Comfort signals increase trap probability but do not guarantee reversal. Require confirmation (failed break, sweep+reclaim, operator exit) before contrarian entries (DT-SL-103..110)."
+    },
+    {
+      "id": "CONFLICT-006",
+      "topic": "Microstructure Reaction vs Candle Close",
+      "note": "SL hunting uses reaction/reclaim behavior on 1m (DT-SL-122/123). Higher-TF closes remain useful for structure hypothesis (DT-DOW-*), but do not override micro reaction in execution."
+    },
+    {
+      "id": "CONFLICT-007",
+      "topic": "Early Profit Booking vs Hold-With-Operator",
+      "note": "Hold-with-operator (DT-SL-088) aims to capture continuation, but DT-SL-111 allows partial profit-taking when exit/distribution signatures appear (DT-SL-086/093)."
+    },
+    {
+      "id": "CONFLICT-008",
+      "topic": "Zone Engine vs Always-Trade Setups",
+      "note": "Zone engine (DT-SL-140..146) can veto otherwise-valid setups when price is in fair zone (DT-SL-141). Treat fair zone as a default no-trade condition unless exceptional confluence exists."
+    },
+    {
+      "id": "CONFLICT-009",
+      "topic": "Adaptive Wait vs Missing Trades",
+      "note": "Waiting 10-20 minutes on unclear open (DT-SL-148) can miss early moves. This is intentional to reduce trap losses; use DT-SL-132 to trade no-pullback trend days only after confirmation."
+    },
+    {
+      "id": "CONFLICT-010",
+      "topic": "WHY Engine vs Narrative Overfitting",
+      "note": "WHY-based classification (DT-SL-133..137) improves decisions but can become storytelling. Always anchor 'why' to observable evidence (liquidity, operator exit/holding, comfort, volatility) and require price confirmation (DT-SL-073)."
+    },
+    {
+      "id": "CONFLICT-011",
+      "topic": "Flow Engine vs Over-Interpretation",
+      "note": "Flow linking (DT-SL-157/167) improves anticipation but can become prediction. Use flow to map likely liquidity creation, not to front-run entries; confirmation still gates execution (DT-SL-073)."
+    },
+    {
+      "id": "CONFLICT-012",
+      "topic": "Large Gap New Chart vs Previous Levels",
+      "note": "On large gaps (DT-SL-163), previous micro levels may lose relevance. Keep PDH/PDL as macro anchors but rebuild intraday structure before trading aggressively."
+    },
+    {
+      "id": "CONFLICT-013",
+      "topic": "Overtrading Cap vs Exceptional Clarity",
+      "note": "DT-SL-166 caps trades/day to reduce drawdown. If you exceed the cap, it must be because all filters align and the market is unusually clean; otherwise stop trading."
+    },
+    {
+      "id": "CONFLICT-014",
+      "topic": "Tight SL vs Adaptive SL Range",
+      "note": "DT-SL-036 prefers tight SL due to path uncertainty. DT-SL-053 allows a slightly wider SL only if it is pre-defined before entry and position size is reduced. Never widen SL after entry."
+    },
+    {
+      "id": "CONFLICT-015",
+      "topic": "1R Capture vs Holding for Continuation",
+      "note": "DT-SL-067 prioritizes first profit capture near ~1R to reduce giveback and emotion. Holding-with-operator (DT-SL-088) is allowed only as a small runner when continuation/holding evidence persists."
+    }
+  ]
+}
