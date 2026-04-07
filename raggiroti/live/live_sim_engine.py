@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
+import math
 
 from raggiroti.backtest.broker_sim import BrokerSim
 from raggiroti.backtest.csv_loader import Candle
@@ -44,6 +45,12 @@ class LiveSimEngine:
         self._settings = get_settings()
         self._broker = BrokerSim()
         self._sb = StateBuilder()
+        # Live needs faster swing confirmation to avoid staying "unknown" too long.
+        # We still keep it conservative with confirmed swings (uses past-only once confirmed).
+        try:
+            self._sb.swing_window = 1
+        except Exception:
+            pass
         self._prev: PrevDayLevels | None = None
         self._gemini = GeminiDecider(api_key=gemini_api_key, model=gemini_model, db_path=self._settings.db_path)
 
@@ -101,6 +108,122 @@ class LiveSimEngine:
         # Keep it raw for now; state builder/LLM can interpret.
         self._oi_snapshot = snapshot
 
+    @staticmethod
+    def _compact_oi_for_llm(snapshot: dict | None) -> dict | None:
+        """
+        Reduce OI snapshot size for per-candle LLM prompts.
+        Keep only: walls + a small strike window (without huge volume fields).
+        """
+        if not isinstance(snapshot, dict) or not snapshot.get("ok"):
+            return snapshot
+
+        out: dict = {
+            "ok": True,
+            "mode": snapshot.get("mode"),
+            "spot": snapshot.get("spot"),
+            "atm_strike": snapshot.get("atm_strike"),
+            "ce_walls": snapshot.get("ce_walls"),
+            "pe_walls": snapshot.get("pe_walls"),
+        }
+
+        win = snapshot.get("window")
+        if isinstance(win, list):
+            w2 = []
+            for row in win[:11]:
+                if not isinstance(row, dict):
+                    continue
+                strike = row.get("strike")
+                ce = row.get("CE") if isinstance(row.get("CE"), dict) else None
+                pe = row.get("PE") if isinstance(row.get("PE"), dict) else None
+                def _leg(d: dict | None) -> dict | None:
+                    if not isinstance(d, dict):
+                        return None
+                    return {"oi": d.get("oi"), "oi_change": d.get("oi_change"), "ltp": d.get("ltp")}
+                w2.append({"strike": strike, "CE": _leg(ce), "PE": _leg(pe)})
+            out["window"] = w2
+        return out
+
+    @staticmethod
+    def _uniq_sorted(levels: list[float]) -> list[float]:
+        out: list[float] = []
+        for x in sorted({float(v) for v in levels if v is not None}):
+            if not out or abs(x - out[-1]) >= 0.01:
+                out.append(float(x))
+        return out
+
+    @staticmethod
+    def _maybe_price(v: object) -> float | None:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, dict) and v.get("price") is not None:
+            try:
+                return float(v.get("price"))
+            except Exception:
+                return None
+        return None
+
+    def _attach_dynamic_liquidity(self, state: dict) -> None:
+        """
+        Add small, high-impact derived fields so Gemini can reason like a "super brain"
+        without requiring it to infer everything from raw OHLC.
+        """
+        try:
+            price = float(state.get("price"))
+        except Exception:
+            return
+
+        # Round numbers near price (50/100 steps).
+        def _rns(step: float) -> list[float]:
+            if step <= 0:
+                return []
+            base = round(price / step) * step
+            return [float(base - step), float(base), float(base + step)]
+
+        state["round_numbers_50"] = _rns(50.0)
+        state["round_numbers_100"] = _rns(100.0)
+
+        # Intraday zone based on session PDH/PDL quartiles (more dynamic than prev-day zones).
+        try:
+            pdh = float(state.get("pdh")) if state.get("pdh") is not None else None
+            pdl = float(state.get("pdl")) if state.get("pdl") is not None else None
+            if pdh is not None and pdl is not None and pdh > pdl:
+                q1 = pdl + 0.25 * (pdh - pdl)
+                q3 = pdl + 0.75 * (pdh - pdl)
+                z = "fair"
+                if price <= q1:
+                    z = "discount"
+                elif price >= q3:
+                    z = "inflated"
+                state["intraday_zone"] = z
+                state["intraday_q1"] = float(q1)
+                state["intraday_q3"] = float(q3)
+        except Exception:
+            pass
+
+        # Liquidity levels: merge prev levels + swings + OI walls.
+        buy = []
+        sell = []
+        buy += [self._maybe_price(state.get("prev_pdl")), self._maybe_price(state.get("prev_last_hour_low")), self._maybe_price(state.get("pdl"))]
+        sell += [self._maybe_price(state.get("prev_pdh")), self._maybe_price(state.get("prev_last_hour_high")), self._maybe_price(state.get("pdh"))]
+        buy += [self._maybe_price(state.get("last_swing_low_1m")), self._maybe_price(state.get("last_swing_low_5m"))]
+        sell += [self._maybe_price(state.get("last_swing_high_1m")), self._maybe_price(state.get("last_swing_high_5m"))]
+        buy += [self._maybe_price(state.get("oi_support"))]
+        sell += [self._maybe_price(state.get("oi_resistance"))]
+
+        # Add a couple nearest OI walls lists (already compact).
+        try:
+            supps = state.get("oi_supports") if isinstance(state.get("oi_supports"), list) else []
+            ress = state.get("oi_resistances") if isinstance(state.get("oi_resistances"), list) else []
+            buy += [float(x) for x in supps[:3] if isinstance(x, (int, float))]
+            sell += [float(x) for x in ress[:3] if isinstance(x, (int, float))]
+        except Exception:
+            pass
+
+        state["liquidity_buy_levels"] = self._uniq_sorted([x for x in buy if x is not None])
+        state["liquidity_sell_levels"] = self._uniq_sorted([x for x in sell if x is not None])
+
     def _ensure_day_initialized(self, candle: LiveCandle) -> None:
         if self._sb.day_open is not None:
             return
@@ -157,8 +280,9 @@ class LiveSimEngine:
 
             state["symbol"] = self.symbol
             state["security_id"] = self.security_id
-            state["oi"] = self._oi_snapshot
-            state.update(derive_oi_features(spot_price=float(c.close), snapshot=self._oi_snapshot))
+            oi_compact = self._compact_oi_for_llm(self._oi_snapshot)
+            state["oi"] = oi_compact
+            state.update(derive_oi_features(spot_price=float(c.close), snapshot=oi_compact))
             state["position"] = (
                 None
                 if self._broker.position is None
@@ -170,6 +294,33 @@ class LiveSimEngine:
                     "qty": self._broker.position.qty,
                 }
             )
+
+            # Attach derived levels + micro-context for better LLM reasoning.
+            try:
+                # Small candle history for pattern/context (kept compact).
+                recent = list(self._candles[-11:])
+                recent.append(
+                    {
+                        "dt": state["dt"],
+                        "open": candle.open,
+                        "high": candle.high,
+                        "low": candle.low,
+                        "close": candle.close,
+                        "volume": candle.volume,
+                    }
+                )
+                state["recent_candles"] = recent[-12:]
+            except Exception:
+                pass
+            try:
+                state["recent_decisions"] = [
+                    {k: v for k, v in d.items() if k in {"dt", "action", "reason"}}
+                    for d in self._decisions[-5:]
+                    if isinstance(d, dict)
+                ]
+            except Exception:
+                pass
+            self._attach_dynamic_liquidity(state)
 
             self._last_state = state
 
