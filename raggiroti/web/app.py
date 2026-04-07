@@ -123,7 +123,7 @@ def _push_live_error(kind: str, detail: object) -> None:
     """
     try:
         item = {
-            "dt": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "dt": datetime.now(tz=_IST).isoformat(timespec="seconds"),
             "kind": str(kind),
             "detail": detail,
         }
@@ -689,6 +689,8 @@ def home() -> str:
         <input name="symbol" value="NIFTY" />
         <label>Feed mode (auto|ticker|quote|full)</label>
         <input name="feed_mode" value="full" />
+        <label>Backfill today since 09:15 (0/1)</label>
+        <input name="seed_today" type="number" value="1" />
         <label>Quantity</label>
         <input name="qty" type="number" value="65" />
         <label>Seed previous trading day (Dhan)</label>
@@ -697,6 +699,7 @@ def home() -> str:
           <button type="submit">Start Live</button>
           <button type="button" onclick="liveStop()">Stop</button>
           <button type="button" onclick="liveStatus()">Status</button>
+          <button type="button" onclick="liveBackfill()">Backfill Today</button>
           <button type="button" onclick="liveState()">State</button>
           <button type="button" onclick="liveLevels()">Levels</button>
           <button type="button" onclick="liveCandles()">Candles</button>
@@ -868,6 +871,16 @@ def home() -> str:
       }
       async function liveStatus() {
         const r = await fetch('/api/live/status');
+        const j = await r.json();
+        document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
+      }
+      async function liveBackfill() {
+        const form = new FormData();
+        // Defaults: today IST, 09:15 -> now-1m
+        form.set('date', '');
+        form.set('from_time', '09:15:00');
+        form.set('to_time', '');
+        const r = await fetch('/api/live/backfill', { method: 'POST', body: form });
         const j = await r.json();
         document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
       }
@@ -1224,6 +1237,7 @@ def _start_live_thread(
     prev_day_candles: list | None,
     prev_day_date: str | None,
     feed_mode: str = "auto",  # auto|ticker|quote|full
+    seed_today: bool = False,
 ) -> None:
     global LIVE_THREAD, LIVE_OI_THREAD, LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_FEED
     assert LIVE_LOOP is not None, "server loop not ready"
@@ -1254,6 +1268,40 @@ def _start_live_thread(
         except Exception:
             pass
     LIVE_CANDLE_BUILDER = CandleBuilder1m()
+
+    # Backfill today's missed 1-minute candles so state (Dow swings/zone/PDH/PDL) has full session context.
+    if seed_today and LIVE_ENGINE is not None:
+        try:
+            now_ist = datetime.now(tz=_IST)
+            today = now_ist.strftime("%Y-%m-%d")
+            # Fetch up to the last COMPLETED minute so we don't overlap with websocket-built candle.
+            to_ist = (now_ist - timedelta(seconds=60)).replace(second=0, microsecond=0)
+            from_dt = datetime.strptime(today + " 09:15:00", "%Y-%m-%d %H:%M:%S")
+            to_dt = datetime.strptime(to_ist.strftime("%Y-%m-%d %H:%M:%S"), "%Y-%m-%d %H:%M:%S")
+            if to_dt > from_dt:
+                req = DhanIntradayRequest(
+                    security_id=str(security_id),
+                    exchange_segment="IDX_I",
+                    instrument="INDEX",
+                    interval="1",
+                    oi=False,
+                    from_dt=from_dt,
+                    to_dt=to_dt,
+                )
+                candles = fetch_intraday_candles(req, access_token=access_token)
+                # Keep only today's candles (Dhan can include older due to windowing).
+                by = group_by_date(candles)
+                today_candles = sorted(by.get(today) or [], key=lambda c: c.dt)
+                if today_candles:
+                    LIVE_ENGINE.prime_from_history(today_candles)
+                    prev = LIVE_SEED_STATUS if isinstance(LIVE_SEED_STATUS, dict) else {}
+                    LIVE_SEED_STATUS = {**prev, "today_seed": {"status": "done", "date": today, "candles": len(today_candles)}}
+        except Exception as e:
+            try:
+                prev = LIVE_SEED_STATUS if isinstance(LIVE_SEED_STATUS, dict) else {}
+                LIVE_SEED_STATUS = {**prev, "today_seed": {"status": "error", "error": f"{type(e).__name__}: {e}"}}
+            except Exception:
+                pass
 
     def _run() -> None:
         global LIVE_FEED, LIVE_THREAD
@@ -1353,7 +1401,7 @@ def _start_live_thread(
                     now = time.time()
                     if (now - float(LIVE_TICK_DEBUG_LAST_PUSH_AT)) >= 5.0:
                         LIVE_TICK_DEBUG_LAST_PUSH_AT = now
-                        item = {"dt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "msg": _compact_tick_msg(msg)}
+                        item = {"dt": datetime.now(tz=_IST).isoformat(timespec="seconds"), "msg": _compact_tick_msg(msg)}
                         with LIVE_TICK_DEBUG_LOCK:
                             LIVE_TICK_DEBUG.append(item)
                             if len(LIVE_TICK_DEBUG) > int(LIVE_TICK_DEBUG_MAX):
@@ -1454,7 +1502,7 @@ def _start_live_thread(
                     exp = oc.expiry_list(under_security_id=int(security_id), under_exchange_segment=ex_seg)
                     with LIVE_OI_DEBUG_LOCK:
                         LIVE_OI_DEBUG = {
-                            "dt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "dt": datetime.now(tz=_IST).isoformat(timespec="seconds"),
                             "expiry_list": _compact_oi_payload(exp),
                         }
                     exp_list = _extract_list_any(exp, ["data", "Data", "expiryList", "expiry_list", "expiries", "expiry"])
@@ -1476,7 +1524,7 @@ def _start_live_thread(
                     prev = LIVE_OI_DEBUG if isinstance(LIVE_OI_DEBUG, dict) else {}
                     LIVE_OI_DEBUG = {
                         **prev,
-                        "dt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "dt": datetime.now(tz=_IST).isoformat(timespec="seconds"),
                         "option_chain": _compact_oi_payload(chain),
                         "expiry_used": expiry,
                     }
@@ -1518,7 +1566,7 @@ def _start_live_thread(
                 )
                 if summary.get("ok"):
                     LIVE_OI_SNAPSHOT = summary
-                    LIVE_OI_UPDATED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    LIVE_OI_UPDATED_AT = datetime.now(tz=_IST).isoformat(timespec="seconds")
                     LIVE_OI_LAST_ERROR = None
                     if LIVE_ENGINE is not None:
                         LIVE_ENGINE.set_oi_snapshot(summary)
@@ -1543,6 +1591,7 @@ def live_start(
     symbol: str = Form(...),
     qty: int = Form(65),
     seed_prev_day: int = Form(1),
+    seed_today: int = Form(1),
     feed_mode: str = Form("full"),
 ) -> JSONResponse:
     """
@@ -1552,6 +1601,7 @@ def live_start(
     - Gemini per-candle decision
     - BrokerSim paper fills only
     """
+    global LIVE_SEED_STATUS
     settings = get_settings()
     client_id = _get_dhan_client_id_raw(settings.db_path)
     access_token = _get_dhan_access_token_raw(settings.db_path)
@@ -1599,6 +1649,20 @@ def live_start(
         except Exception:
             pass
 
+    # If user wants a full morning-to-now context, prefer doing prev-day seeding synchronously
+    # (so day_open scenario and zones are correct before we backfill today's candles).
+    prev_day_candles = None
+    prev_day_date = None
+    if int(seed_prev_day) == 1 and int(seed_today) == 1:
+        try:
+            out = _fetch_prev_trading_day_candles(security_id=sec, access_token=access_token)
+            if out is not None:
+                prev_day_date, prev_day_candles = out
+                global LIVE_SEED_STATUS
+                LIVE_SEED_STATUS = {"status": "done", "result": {"prev_day_date": prev_day_date, "candles": len(prev_day_candles)}}
+        except Exception as e:
+            LIVE_SEED_STATUS = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
     with LIVE_LOCK:
         if LIVE_THREAD is not None and LIVE_THREAD.is_alive() and LIVE_ENGINE is not None and not LIVE_STOP.is_set():
             # Idempotent start: if already running, return success + status instead of 400.
@@ -1619,13 +1683,14 @@ def live_start(
             gemini_key=gemini_key,
             gemini_model=gemini_model,
             qty=int(qty),
-            prev_day_candles=None,
-            prev_day_date=None,
+            prev_day_candles=prev_day_candles,
+            prev_day_date=prev_day_date,
             feed_mode=feed_mode,
+            seed_today=(int(seed_today) == 1),
         )
-        if int(seed_prev_day) == 1:
+        if int(seed_prev_day) == 1 and prev_day_candles is None:
             # Seed previous-day candles asynchronously so /api/live/start responds immediately.
-            global LIVE_SEED_THREAD, LIVE_SEED_STATUS
+            global LIVE_SEED_THREAD
             LIVE_SEED_STATUS = {"status": "queued"}
 
             def _seed() -> None:
@@ -1666,9 +1731,73 @@ def live_start(
     )
 
 
+@app.post("/api/live/backfill")
+def live_backfill(
+    date: str = Form(""),
+    from_time: str = Form("09:15:00"),
+    to_time: str = Form(""),
+) -> JSONResponse:
+    """
+    Backfill missed 1-minute candles from Dhan historical API and prime the engine state.
+
+    Safe behavior:
+    - Only allowed when live is running AND no candles have been formed yet in this run.
+      (Otherwise we'd need a full replay/reset to avoid inconsistent state.)
+    """
+    if LIVE_ENGINE is None:
+        return JSONResponse({"ok": False, "error": "not running"}, status_code=400)
+    if LIVE_ENGINE.last_candles(limit=1):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "cannot backfill after candles already exist; stop and start again with seed_today=1",
+            },
+            status_code=400,
+        )
+
+    settings = get_settings()
+    access_token = _get_dhan_access_token_raw(settings.db_path)
+    if not access_token:
+        return JSONResponse({"ok": False, "error": "missing dhan access token"}, status_code=400)
+
+    try:
+        d = (date or "").strip() or datetime.now(tz=_IST).strftime("%Y-%m-%d")
+        ft = (from_time or "").strip() or "09:15:00"
+        tt = (to_time or "").strip()
+        if not tt:
+            now_ist = datetime.now(tz=_IST)
+            tt = (now_ist - timedelta(seconds=60)).strftime("%H:%M:%S")
+        from_dt = datetime.strptime(d + " " + ft, "%Y-%m-%d %H:%M:%S")
+        to_dt = datetime.strptime(d + " " + tt, "%Y-%m-%d %H:%M:%S")
+        if to_dt <= from_dt:
+            raise ValueError("to_time must be after from_time")
+
+        req = DhanIntradayRequest(
+            security_id=str(LIVE_ENGINE.security_id),
+            exchange_segment="IDX_I",
+            instrument="INDEX",
+            interval="1",
+            oi=False,
+            from_dt=from_dt,
+            to_dt=to_dt,
+        )
+        candles = fetch_intraday_candles(req, access_token=access_token)
+        by = group_by_date(candles)
+        use = sorted(by.get(d) or [], key=lambda c: c.dt)
+        if not use:
+            return JSONResponse({"ok": False, "error": "no candles returned for range", "date": d}, status_code=400)
+        out = LIVE_ENGINE.prime_from_history(use)
+        global LIVE_SEED_STATUS
+        prev = LIVE_SEED_STATUS if isinstance(LIVE_SEED_STATUS, dict) else {}
+        LIVE_SEED_STATUS = {**prev, "today_seed": {"status": "done", "date": d, "candles": len(use), "range": [ft, tt]}}
+        return JSONResponse({"ok": True, "date": d, "range": [ft, tt], "candles": len(use), "result": out})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
 @app.post("/api/live/stop")
 def live_stop() -> JSONResponse:
-    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR, LIVE_FEED, LIVE_THREAD, LIVE_OI_THREAD
+    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR, LIVE_FEED, LIVE_THREAD, LIVE_OI_THREAD, LIVE_SEED_THREAD, LIVE_SEED_STATUS
     LIVE_STOP.set()
     # Best-effort: disconnect websocket to unblock run_forever() so the thread can exit quickly.
     t0: threading.Thread | None = None
@@ -1699,7 +1828,6 @@ def live_stop() -> JSONResponse:
         LIVE_OI_SNAPSHOT = None
         LIVE_OI_UPDATED_AT = None
         LIVE_OI_LAST_ERROR = None
-        global LIVE_SEED_THREAD, LIVE_SEED_STATUS
         LIVE_SEED_THREAD = None
         LIVE_SEED_STATUS = None
     except Exception:
@@ -1918,7 +2046,7 @@ def live_update_oi(payload: dict = Body(...)) -> JSONResponse:
     global LIVE_OI_SNAPSHOT
     LIVE_OI_SNAPSHOT = payload
     global LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
-    LIVE_OI_UPDATED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    LIVE_OI_UPDATED_AT = datetime.now(tz=_IST).isoformat(timespec="seconds")
     LIVE_OI_LAST_ERROR = None
     if LIVE_ENGINE is not None:
         LIVE_ENGINE.set_oi_snapshot(payload)

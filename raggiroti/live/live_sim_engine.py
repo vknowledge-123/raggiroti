@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 import math
+from zoneinfo import ZoneInfo
 
 from raggiroti.backtest.broker_sim import BrokerSim
 from raggiroti.backtest.csv_loader import Candle
@@ -16,6 +17,12 @@ from raggiroti.rag.rule_retriever import retrieve_rulebook_rules
 from raggiroti.dhan.option_chain import derive_oi_features
 
 from .models import DecisionOut, LiveCandle
+
+
+try:
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:  # pragma: no cover
+    _IST = timezone(timedelta(hours=5, minutes=30))
 
 
 @dataclass
@@ -54,7 +61,7 @@ class LiveSimEngine:
         self._prev: PrevDayLevels | None = None
         self._gemini = GeminiDecider(api_key=gemini_api_key, model=gemini_model, db_path=self._settings.db_path)
 
-        self._started_at = datetime.now(timezone.utc).isoformat()
+        self._started_at = datetime.now(tz=_IST).isoformat(timespec="seconds")
         self._last_candle: LiveCandle | None = None
         self._last_state: dict | None = None
         self._decisions: list[dict[str, Any]] = []
@@ -107,6 +114,57 @@ class LiveSimEngine:
     def set_oi_snapshot(self, snapshot: dict | None) -> None:
         # Keep it raw for now; state builder/LLM can interpret.
         self._oi_snapshot = snapshot
+
+    def prime_from_history(self, candles: list[Candle]) -> dict:
+        """
+        Prime the engine's state from historical 1-minute candles (e.g., missed 09:15 -> now).
+        This does NOT place any trades and does NOT call Gemini.
+
+        Intended use:
+        - start the live engine mid-session
+        - fetch missed candles via Dhan historical API
+        - replay them so Dow swings / zones / PDH/PDL and other state have full context
+        """
+        n_in = 0
+        n_used = 0
+        last_state: dict | None = None
+        for c in candles or []:
+            n_in += 1
+            if not isinstance(c, Candle):
+                continue
+            # Ensure day initialized once (prev day levels already set via set_prev_day_candles()).
+            if self._sb.day_open is None:
+                self._sb.on_new_day(prev=self._prev)
+
+            st = self._sb.update(c)
+            # No trading during priming; but update broker trailing/SL bookkeeping if needed.
+            try:
+                self._broker.on_candle(st["dt"], high=c.high, low=c.low)
+            except Exception:
+                pass
+
+            st["symbol"] = self.symbol
+            st["security_id"] = self.security_id
+            st["oi"] = None
+            st.update(derive_oi_features(spot_price=float(c.close), snapshot=None))
+            st["position"] = None
+            self._attach_dynamic_liquidity(st)
+
+            self._candles.append(
+                {
+                    "dt": st["dt"],
+                    "open": c.open,
+                    "high": c.high,
+                    "low": c.low,
+                    "close": c.close,
+                    "volume": c.volume,
+                }
+            )
+            last_state = st
+            n_used += 1
+
+        self._last_state = last_state
+        return {"ok": True, "candles_in": int(n_in), "candles_used": int(n_used), "last_dt": None if last_state is None else last_state.get("dt")}
 
     @staticmethod
     def _compact_oi_for_llm(snapshot: dict | None) -> dict | None:
