@@ -350,6 +350,20 @@ def _validate_full_prediction_shape(out: dict, expected_keys: list[str]) -> str 
         return "gap_plan_keys_mismatch"
     return None
 
+
+def _replace_bucket_plan(out: dict, bucket_key: str, plan: dict) -> dict:
+    if not isinstance(out, dict):
+        return out
+    plans = out.get("gap_plans")
+    if not isinstance(plans, list):
+        return out
+    for i, p in enumerate(plans):
+        if isinstance(p, dict) and p.get("bucket_key") == bucket_key:
+            plans[i] = plan
+            break
+    out["gap_plans"] = plans
+    return out
+
 def _truncate(s: str, n: int = 240) -> str:
     s = (s or "").strip()
     if len(s) <= n:
@@ -825,6 +839,137 @@ class NextDayPredictor:
                 "_fallback": True,
             }
 
+        def _bucket_llm_plan(client: httpx.Client, bucket: dict) -> tuple[dict | None, str | None]:
+            """
+            More reliable fallback path: plan one bucket per request (small output -> fewer schema failures).
+            Returns (plan, error). plan includes full bucket fields if successful.
+            """
+            bkey = str(bucket.get("key") or "")
+            bp = {
+                "bucket": bucket,
+                "instrument": prompt_payload.get("instrument"),
+                "security_id": prompt_payload.get("security_id"),
+                "target_date": prompt_payload.get("target_date"),
+                "prev_levels": prompt_payload.get("prev_levels"),
+                "stats": prompt_payload.get("stats"),
+                "oi": prompt_payload.get("oi"),
+                "retrieved": prompt_payload.get("retrieved"),
+            }
+
+            bucket_only_schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "bucket_key": {"type": "string"},
+                    "gap_points_min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "gap_points_max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "bias": {"type": "string", "enum": ["BUY", "SELL", "WAIT"]},
+                    "entry_zone": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                            {"type": "null"},
+                        ]
+                    },
+                    "operator_zone": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                            {"type": "null"},
+                        ]
+                    },
+                    "no_trade_zone": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                            {"type": "null"},
+                        ]
+                    },
+                    "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "targets": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3},
+                    "liquidity_pools": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3},
+                    "reason_points": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                },
+                "required": [
+                    "bucket_key",
+                    "gap_points_min",
+                    "gap_points_max",
+                    "bias",
+                    "entry_zone",
+                    "operator_zone",
+                    "no_trade_zone",
+                    "sl",
+                    "targets",
+                    "liquidity_pools",
+                    "reason_points",
+                ],
+            }
+
+            sys_bucket = (
+                "You are a next-day SL-hunting planner. "
+                "Plan ONLY the provided bucket. Output strict JSON only, matching schema. "
+                "One-sided bias: BUY or SELL; if unclear use WAIT. "
+                "Do not mention both longs and shorts in reasons. "
+                "Use OI walls + prev-day swings + PDH/PDL and Dow structure. "
+                "Keep arrays small (<=3)."
+            )
+
+            body_bucket = {
+                "systemInstruction": {"parts": [{"text": sys_bucket}]},
+                "safetySettings": body.get("safetySettings"),
+                "contents": [{"role": "user", "parts": [{"text": json.dumps(bp, ensure_ascii=False)}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": 700,
+                    "responseMimeType": "application/json",
+                    "_responseJsonSchema": bucket_only_schema,
+                },
+            }
+
+            try:
+                r = client.post(url, headers=headers, json=body_bucket)
+                if r.status_code >= 400 and ("_responseJsonSchema" in body_bucket["generationConfig"] or "responseSchema" in body_bucket["generationConfig"]):
+                    body_bucket["generationConfig"].pop("_responseJsonSchema", None)
+                    body_bucket["generationConfig"].pop("responseSchema", None)
+                    r = client.post(url, headers=headers, json=body_bucket)
+                r.raise_for_status()
+                data = r.json()
+                text = _extract_candidate_text(data)
+                outb = _extract_json(text)
+                if not isinstance(outb, dict):
+                    return None, "bucket_output_not_object"
+                outb["bucket_key"] = bkey
+                outb["gap_points_min"] = None if bucket.get("min") is None else float(bucket.get("min"))
+                outb["gap_points_max"] = None if bucket.get("max") is None else float(bucket.get("max"))
+                outb["bias"] = _coerce_bias(outb.get("bias"))
+                return outb, None
+            except Exception as e:
+                return None, _sanitize_error(str(e))
+
+        def _bucket_level_plans(client: httpx.Client, why: str) -> dict:
+            """
+            Produce a full 11-bucket plan by running Gemini per bucket.
+            Falls back per-bucket if Gemini fails for that bucket.
+            """
+            base_out = _fallback_prediction(f"bucket_level:{why}")
+            any_llm = False
+            any_bucket_fallback = False
+            for b in gap_buckets:
+                plan, err = _bucket_llm_plan(client, b)
+                if plan is None:
+                    any_bucket_fallback = True
+                    continue
+                any_llm = True
+                _replace_bucket_plan(base_out, str(b.get("key")), plan)
+
+            sp = [
+                "Bucket-level planning used (full-output schema failed).",
+                f"Reason: {why}",
+                "Some buckets may still use deterministic fallback if Gemini failed for that bucket.",
+            ]
+            base_out["summary_points"] = sp[:8]
+            base_out["_fallback"] = not any_llm
+            base_out["_bucket_level"] = True
+            base_out["_partial_bucket_fallback"] = bool(any_bucket_fallback)
+            return base_out
+
         out: dict | None = None
         last_err: str | None = None
         expected_keys = _expected_bucket_keys(gap_buckets)
@@ -914,8 +1059,8 @@ class NextDayPredictor:
                 if bad3 is None:
                     out = out3
                 else:
-                    # Merge single-bucket output into fallback so caller always gets all regimes.
-                    out = _merge_single_bucket_into_fallback(out, _fallback_prediction(f"gemini_invalid_shape:{bad}->{bad3}"), expected_keys)
+                    # Final fallback: build full plan via per-bucket Gemini calls (much more reliable).
+                    out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad}->{bad3}")
         except Exception as e:
             last_err = _sanitize_error(str(e))
             # One parse retry: no schema.
@@ -937,11 +1082,8 @@ class NextDayPredictor:
                 out = _extract_json(text2)
                 bad2 = _validate_full_prediction_shape(out, expected_keys)
                 if bad2 is not None:
-                    # Merge/expand if we got a single bucket.
-                    if _looks_like_single_bucket_output(out):
-                        out = _merge_single_bucket_into_fallback(out, _fallback_prediction(f"gemini_invalid_shape:{bad2}"), expected_keys)
-                    else:
-                        out = _fallback_prediction(f"gemini_invalid_shape:{bad2}")
+                    # If schema isn't working, go bucket-by-bucket to guarantee full regime output.
+                    out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad2}")
                 last_err = None
             except Exception as e2:
                 last_err = f"{last_err} / retry_failed: {_sanitize_error(str(e2))}"
