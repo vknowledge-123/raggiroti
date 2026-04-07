@@ -1796,7 +1796,8 @@ async def predict_next_day_submit(
             if not access_token:
                 raise ValueError("missing dhan access token; save it on home page first")
             gemini_key = _get_gemini_api_key_raw(settings.db_path)
-            gemini_model = _get_gemini_decision_model_raw(settings.db_path) or "gemini-2.5-flash"
+            # Prediction is once per day; prefer a more reliable model than per-candle decisions.
+            gemini_model = _get_gemini_extract_model_raw(settings.db_path) or _get_gemini_decision_model_raw(settings.db_path) or "gemini-2.5-pro"
             if not gemini_key:
                 raise ValueError("missing gemini api key; save it on home page first")
 

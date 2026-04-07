@@ -113,6 +113,28 @@ def _sanitize_error(s: str) -> str:
     s = s or ""
     return s.replace("\n", " ").strip()
 
+def _truncate(s: str, n: int = 240) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+def _compact_rules(rules: list[dict], limit: int = 25) -> list[dict]:
+    out = []
+    for r in (rules or [])[: int(limit)]:
+        out.append(
+            {
+                "id": r.get("id"),
+                "category": r.get("category"),
+                "name": _truncate(str(r.get("name") or ""), 120),
+                "condition": _truncate(str(r.get("condition") or ""), 260),
+                "action": _truncate(str(r.get("action") or ""), 260),
+                "tags": r.get("tags") or [],
+            }
+        )
+    return out
+
 
 @dataclass(frozen=True)
 class NextDayPrediction:
@@ -300,7 +322,11 @@ class NextDayPredictor:
             "stats": stats,
             "oi": oi_features,
             "gap_buckets": gap_buckets,
-            "retrieved": {"rulebook_version": retrieved.rulebook_version, "rules": retrieved.rules},
+            "retrieved": {
+                "rulebook_version": retrieved.rulebook_version,
+                # Keep prompt small and stable (reduces Gemini JSON failures).
+                "rules": _compact_rules(retrieved.rules, limit=22),
+            },
         }
 
         req_hash = _hash_request({"predict_next_day": prompt_payload, "schema_version": 1})
@@ -308,6 +334,17 @@ class NextDayPredictor:
         cached = store.get_llm_cache(req_hash, self.model)
         if cached is not None:
             store.close()
+            try:
+                if isinstance(cached, dict) and isinstance(cached.get("gap_plans"), dict):
+                    plans = []
+                    for k, v in cached["gap_plans"].items():
+                        if isinstance(v, dict):
+                            v2 = dict(v)
+                            v2.setdefault("bucket_key", str(k))
+                            plans.append(v2)
+                    cached["gap_plans"] = plans
+            except Exception:
+                pass
             return NextDayPrediction(
                 ok=True,
                 instrument=instrument,
@@ -316,7 +353,7 @@ class NextDayPredictor:
                 training_start_date=training_start_date,
                 training_end_date=prev_date_used,
                 prev_date_used=prev_date_used,
-                prev_levels=prev_levels.__dict__,
+                prev_levels={**prev_levels.__dict__, "symbol": instrument},
                 stats=stats,
                 oi=oi_features,
                 retrieved_rules={"rulebook_version": retrieved.rulebook_version, "count": len(retrieved.rules)},
@@ -327,6 +364,9 @@ class NextDayPredictor:
             "type": "object",
             "additionalProperties": False,
             "properties": {
+                "bucket_key": {"type": "string"},
+                "gap_points_min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                "gap_points_max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 "bias": {"type": "string", "enum": ["BUY", "SELL", "WAIT"]},
                 "entry_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
                 "operator_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
@@ -336,7 +376,7 @@ class NextDayPredictor:
                 "liquidity_pools": {"type": "array", "items": {"type": "number"}},
                 "reason_points": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
+            "required": ["bucket_key", "gap_points_min", "gap_points_max", "bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
         }
 
         schema = {
@@ -357,11 +397,7 @@ class NextDayPredictor:
                     },
                     "required": ["prev_close", "PDH", "PDL", "operator_sell_zone", "operator_buy_zone", "no_trade_zone"],
                 },
-                "gap_plans": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {k["key"]: bucket_schema for k in gap_buckets},
-                },
+                "gap_plans": {"type": "array", "items": bucket_schema},
             },
             "required": ["summary_points", "base_levels", "gap_plans"],
         }
@@ -405,19 +441,43 @@ class NextDayPredictor:
 
             def _bucket_plan(b: dict) -> dict:
                 typ = b["type"]
+                k = str(b.get("key"))
+                # expected open zone for the bucket
+                if typ == "gap_up":
+                    gmin = float(b.get("min") or 0.0)
+                    gmax = float(b.get("max") or (gmin + 50.0))
+                    open_zone = [pc + gmin, pc + gmax]
+                else:
+                    # negative points
+                    gmin = float(b.get("min") if b.get("min") is not None else (-(abs(b.get("max") or 250.0) + 50.0)))
+                    gmax = float(b.get("max") or -50.0)
+                    open_zone = [pc + gmin, pc + gmax]
+
                 if typ == "gap_up":
                     bias = "SELL"
-                    entry_zone = [pdh - 5.0, pdh + 15.0]
-                    sl = pdh + 30.0
+                    # If open is far above PDH, use open-zone rejection; else use PDH zone.
+                    if open_zone[0] >= (pdh + 40.0):
+                        entry_zone = [open_zone[0] - 10.0, open_zone[1] + 10.0]
+                        sl = open_zone[1] + 30.0
+                    else:
+                        entry_zone = [pdh - 5.0, pdh + 15.0]
+                        sl = pdh + 30.0
                     targets = [pc, q1, pdl]
                     pools = [pdh, pc, pdl]
                 else:
                     bias = "BUY"
-                    entry_zone = [pdl - 15.0, pdl + 5.0]
-                    sl = pdl - 30.0
+                    if open_zone[1] <= (pdl - 40.0):
+                        entry_zone = [open_zone[0] - 10.0, open_zone[1] + 10.0]
+                        sl = open_zone[0] - 30.0
+                    else:
+                        entry_zone = [pdl - 15.0, pdl + 5.0]
+                        sl = pdl - 30.0
                     targets = [pc, q3, pdh]
                     pools = [pdl, pc, pdh]
                 return {
+                    "bucket_key": k,
+                    "gap_points_min": None if b.get("min") is None else float(b.get("min")),
+                    "gap_points_max": None if b.get("max") is None else float(b.get("max")),
                     "bias": bias,
                     "entry_zone": entry_zone,
                     "operator_zone": base["operator_sell_zone"] if bias == "SELL" else base["operator_buy_zone"],
@@ -432,7 +492,7 @@ class NextDayPredictor:
                     ],
                 }
 
-            gap_plans = {b["key"]: _bucket_plan(b) for b in gap_buckets}
+            gap_plans = [_bucket_plan(b) for b in gap_buckets]
             return {
                 "summary_points": [
                     "Fallback prediction used due to Gemini JSON error.",
@@ -492,9 +552,25 @@ class NextDayPredictor:
                 last_err = f"{last_err} / retry_failed: {_sanitize_error(str(e2))}"
                 out = _fallback_prediction(last_err)
 
-        cache_id = f"pred_{req_hash[:16]}"
-        store.set_llm_cache(cache_id, datetime.now(timezone.utc).isoformat(), self.model, req_hash, out)
+        # Cache only valid Gemini outputs. Do NOT cache fallbacks; otherwise a transient Gemini failure
+        # would permanently poison future predictions for the same payload/model.
+        if not (isinstance(out, dict) and out.get("_fallback") is True):
+            cache_id = f"pred_{req_hash[:16]}"
+            store.set_llm_cache(cache_id, datetime.now(timezone.utc).isoformat(), self.model, req_hash, out)
         store.close()
+
+        # Normalize output shape if Gemini returns gap_plans as an object (older format).
+        try:
+            if isinstance(out, dict) and isinstance(out.get("gap_plans"), dict):
+                plans = []
+                for k, v in out["gap_plans"].items():
+                    if isinstance(v, dict):
+                        v2 = dict(v)
+                        v2.setdefault("bucket_key", str(k))
+                        plans.append(v2)
+                out["gap_plans"] = plans
+        except Exception:
+            pass
 
         return NextDayPrediction(
             ok=True,
@@ -504,7 +580,7 @@ class NextDayPredictor:
             training_start_date=training_start_date,
             training_end_date=prev_date_used,
             prev_date_used=prev_date_used,
-            prev_levels=prev_levels.__dict__,
+            prev_levels={**prev_levels.__dict__, "symbol": instrument},
             stats=stats,
             oi=oi_features,
             retrieved_rules={"rulebook_version": retrieved.rulebook_version, "count": len(retrieved.rules)},
