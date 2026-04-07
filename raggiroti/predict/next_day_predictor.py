@@ -248,6 +248,108 @@ def _sanitize_prediction_output(out: dict) -> dict:
     out["gap_plans"] = new_plans
     return out
 
+
+def _expected_bucket_keys(gap_buckets: list[dict]) -> list[str]:
+    keys: list[str] = []
+    for b in gap_buckets or []:
+        k = b.get("key")
+        if isinstance(k, str) and k:
+            keys.append(k)
+    return keys
+
+
+def _looks_like_single_bucket_output(out: dict) -> bool:
+    if not isinstance(out, dict):
+        return False
+    # Common legacy/incorrect shapes we've observed from LLMs when schema isn't enforced.
+    return any(k in out for k in ("gap_bucket", "bucket", "bucket_key")) and "gap_plans" not in out
+
+
+def _coerce_bias(v: object) -> str:
+    s = str(v or "").strip().upper()
+    if s in {"BUY", "SELL", "WAIT"}:
+        return s
+    if s in {"BULLISH", "LONG"}:
+        return "BUY"
+    if s in {"BEARISH", "SHORT"}:
+        return "SELL"
+    return "WAIT"
+
+
+def _merge_single_bucket_into_fallback(single: dict, fallback: dict, expected_keys: list[str]) -> dict:
+    """
+    If Gemini returns only one bucket, merge it into the fallback full-bucket structure.
+    This ensures UI always gets all regimes (flat + all gaps) even when Gemini misbehaves.
+    """
+    if not isinstance(single, dict) or not isinstance(fallback, dict):
+        return fallback
+    plans = fallback.get("gap_plans")
+    if not isinstance(plans, list):
+        return fallback
+
+    k = single.get("gap_bucket") or single.get("bucket_key") or single.get("bucket")
+    if not isinstance(k, str) or k not in expected_keys:
+        return fallback
+
+    bias = _coerce_bias(single.get("bias"))
+    # Accept common field aliases
+    entry_zone = single.get("entry_zone") or single.get("entry") or None
+    operator_zone = single.get("operator_zone") or single.get("operator") or None
+    no_trade_zone = single.get("no_trade_zone") or single.get("no_trade") or None
+    sl = single.get("sl")
+    targets = single.get("targets") or []
+    pools = single.get("liquidity_pools") or single.get("liquidity") or []
+    reasons = single.get("reason_points") or single.get("reasons") or []
+
+    for p in plans:
+        if not isinstance(p, dict):
+            continue
+        if p.get("bucket_key") != k:
+            continue
+        p["bias"] = bias
+        p["entry_zone"] = entry_zone
+        p["operator_zone"] = operator_zone
+        p["no_trade_zone"] = no_trade_zone
+        p["sl"] = sl
+        p["targets"] = targets
+        p["liquidity_pools"] = pools
+        p["reason_points"] = reasons
+        break
+
+    sp = fallback.get("summary_points")
+    if not isinstance(sp, list):
+        sp = []
+    sp = list(sp)[:6]
+    sp.insert(0, f"Gemini returned single-bucket output ({k}); merged into full regime plan.")
+    fallback["summary_points"] = sp[:8]
+    fallback["_fallback"] = True
+    fallback["_partial_merge"] = True
+    return fallback
+
+
+def _validate_full_prediction_shape(out: dict, expected_keys: list[str]) -> str | None:
+    """
+    Returns None if OK, else returns a short reason string.
+    """
+    if not isinstance(out, dict):
+        return "not_a_dict"
+    if not isinstance(out.get("summary_points"), list):
+        return "missing_summary_points"
+    if not isinstance(out.get("base_levels"), dict):
+        return "missing_base_levels"
+    plans = out.get("gap_plans")
+    if not isinstance(plans, list):
+        return "missing_gap_plans"
+    keys = []
+    for p in plans:
+        if isinstance(p, dict) and isinstance(p.get("bucket_key"), str):
+            keys.append(p["bucket_key"])
+    if len(keys) != len(expected_keys):
+        return f"gap_plans_len_mismatch:{len(keys)}"
+    if set(keys) != set(expected_keys):
+        return "gap_plan_keys_mismatch"
+    return None
+
 def _truncate(s: str, n: int = 240) -> str:
     s = (s or "").strip()
     if len(s) <= n:
@@ -538,7 +640,7 @@ class NextDayPredictor:
                 "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 "targets": {"type": "array", "items": {"type": "number"}, "maxItems": 5},
                 "liquidity_pools": {"type": "array", "items": {"type": "number"}, "maxItems": 8},
-                "reason_points": {"type": "array", "items": {"type": "string", "maxLength": 180}, "maxItems": 4},
+                "reason_points": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
             },
             "required": ["bucket_key", "gap_points_min", "gap_points_max", "bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
         }
@@ -547,7 +649,7 @@ class NextDayPredictor:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "summary_points": {"type": "array", "items": {"type": "string", "maxLength": 220}, "maxItems": 8},
+                "summary_points": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
                 "base_levels": {
                     "type": "object",
                     "additionalProperties": False,
@@ -711,6 +813,7 @@ class NextDayPredictor:
 
         out: dict | None = None
         last_err: str | None = None
+        expected_keys = _expected_bucket_keys(gap_buckets)
         try:
             data: dict | None = None
             schema_dropped = False
@@ -757,6 +860,46 @@ class NextDayPredictor:
 
             if out is None:
                 raise RuntimeError("gemini_error: empty_or_unparseable_response" + (" (schema_dropped)" if schema_dropped else ""))
+
+            # Validate shape; if Gemini returned a single bucket or wrong schema, try one repair call.
+            bad = _validate_full_prediction_shape(out, expected_keys)
+            if bad is not None:
+                # Attempt a repair call (still small; reuses same prompt payload).
+                repair_payload = {
+                    "note": "The previous output did not match the required schema. Re-emit strictly per schema.",
+                    "expected_bucket_keys": expected_keys,
+                    "gap_buckets": gap_buckets,
+                    "prev_levels": prompt_payload.get("prev_levels"),
+                    "stats": prompt_payload.get("stats"),
+                    "oi": prompt_payload.get("oi"),
+                    "retrieved": prompt_payload.get("retrieved"),
+                    "previous_output": out,
+                }
+                body_repair = {
+                    "systemInstruction": body.get("systemInstruction"),
+                    "safetySettings": body.get("safetySettings"),
+                    "contents": [{"role": "user", "parts": [{"text": json.dumps(repair_payload, ensure_ascii=False)}]}],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "maxOutputTokens": 4096,
+                        "responseMimeType": "application/json",
+                        "responseJsonSchema": schema,
+                    },
+                }
+                r3 = client.post(url, headers=headers, json=body_repair)
+                if r3.status_code >= 400 and "responseJsonSchema" in body_repair["generationConfig"]:
+                    body_repair["generationConfig"].pop("responseJsonSchema", None)
+                    r3 = client.post(url, headers=headers, json=body_repair)
+                r3.raise_for_status()
+                data3 = r3.json()
+                text3 = _extract_candidate_text(data3)
+                out3 = _extract_json(text3)
+                bad3 = _validate_full_prediction_shape(out3, expected_keys)
+                if bad3 is None:
+                    out = out3
+                else:
+                    # Merge single-bucket output into fallback so caller always gets all regimes.
+                    out = _merge_single_bucket_into_fallback(out, _fallback_prediction(f"gemini_invalid_shape:{bad}->{bad3}"), expected_keys)
         except Exception as e:
             last_err = _sanitize_error(str(e))
             # One parse retry: no schema.
@@ -776,6 +919,13 @@ class NextDayPredictor:
                     data2 = r2.json()
                 text2 = _extract_candidate_text(data2)
                 out = _extract_json(text2)
+                bad2 = _validate_full_prediction_shape(out, expected_keys)
+                if bad2 is not None:
+                    # Merge/expand if we got a single bucket.
+                    if _looks_like_single_bucket_output(out):
+                        out = _merge_single_bucket_into_fallback(out, _fallback_prediction(f"gemini_invalid_shape:{bad2}"), expected_keys)
+                    else:
+                        out = _fallback_prediction(f"gemini_invalid_shape:{bad2}")
                 last_err = None
             except Exception as e2:
                 last_err = f"{last_err} / retry_failed: {_sanitize_error(str(e2))}"
