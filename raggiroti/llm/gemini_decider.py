@@ -159,6 +159,53 @@ def _is_schema_related_400(resp: httpx.Response) -> bool:
         return False
 
 
+def _salvage_decision_from_text(text: str) -> dict | None:
+    """
+    Last-resort recovery when Gemini returns invalid/truncated JSON.
+    Extract action/sl/targets via regex so live simulation does not depend on perfect JSON.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    # action
+    action = None
+    m = re.search(r'"action"\s*:\s*"?(BUY|SELL|WAIT|EXIT)"?', t, re.IGNORECASE)
+    if m:
+        action = m.group(1).upper()
+    else:
+        m2 = re.search(r"\b(BUY|SELL|WAIT|EXIT)\b", t, re.IGNORECASE)
+        if m2:
+            action = m2.group(1).upper()
+
+    if action not in {"BUY", "SELL", "WAIT", "EXIT"}:
+        return None
+
+    # sl
+    sl = None
+    m = re.search(r'"sl"\s*:\s*(null|[-]?\d+(?:\.\d+)?)', t, re.IGNORECASE)
+    if m:
+        v = m.group(1).lower()
+        if v != "null":
+            try:
+                sl = float(v)
+            except Exception:
+                sl = None
+
+    # targets
+    targets: list[float] = []
+    m = re.search(r'"targets"\s*:\s*\[([^\]]*)\]', t, re.IGNORECASE | re.DOTALL)
+    if m:
+        inner = m.group(1)
+        for num in re.findall(r"[-]?\d+(?:\.\d+)?", inner):
+            try:
+                targets.append(float(num))
+            except Exception:
+                continue
+
+    return {"action": action, "sl": sl, "targets": targets[:5]}
+
+
 def _normalize_model_id(model: str) -> str:
     """
     Accept both forms:
@@ -220,6 +267,9 @@ class GeminiDecider:
             "If unclear, output WAIT. "
             "If state.daily_plan is present, prefer its bias (one-sided). "
             "Avoid overtrading: do not suggest repeated re-entries after SL unless a NEW sweep+reclaim event appears. "
+            "If state.position is NOT null: do NOT output BUY/SELL. Output only EXIT or WAIT. "
+            "If in LONG and Dow structure flips bearish (dow_structure_1m/5m) or price breaks last swing low, output EXIT. "
+            "If in SHORT and Dow structure flips bullish (dow_structure_1m/5m) or price breaks last swing high, output EXIT. "
             "Use swing highs/lows and sweep/reclaim levels for SL and targets (liquidity pools). "
             "Output STRICT JSON only with keys: action, sl, targets. "
             "sl and targets must be ABSOLUTE price levels for the underlying index. "
@@ -254,6 +304,7 @@ class GeminiDecider:
         headers = {"x-goog-api-key": self.api_key}
         data: dict | None = None
         last_err: str | None = None
+        last_fb: dict | None = None
         with httpx.Client(timeout=self.timeout_s) as client:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
@@ -272,10 +323,16 @@ class GeminiDecider:
                         # Non-transient: don't retry; bubble up.
                         raise
                     data = r.json()
+                    last_fb = _gemini_feedback(data)
                     # Treat empty candidate text as transient: retry (it happens occasionally with JSON mode).
                     if not _extract_candidate_text(data):
-                        fb = _gemini_feedback(data)
-                        raise ValueError(f"empty_candidate_text: {json.dumps(fb, ensure_ascii=False)}")
+                        raise ValueError(f"empty_candidate_text: {json.dumps(last_fb, ensure_ascii=False)}")
+                    # If model hit MAX_TOKENS, increase budget and retry before parsing.
+                    if last_fb and last_fb.get("finish_reason") == "MAX_TOKENS" and attempt < int(self.max_retries):
+                        cur = int(body.get("generationConfig", {}).get("maxOutputTokens") or 256)
+                        body["generationConfig"]["maxOutputTokens"] = min(max(cur * 2, 512), 1024)
+                        time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                        continue
                     last_err = None
                     break
                 except httpx.HTTPStatusError as e:
@@ -311,35 +368,40 @@ class GeminiDecider:
             if not isinstance(out.get("targets"), list):
                 raise ValueError("targets must be list")
         except Exception as e:
-            # One retry for parse errors: ask again with simpler settings (no schema, plain text JSON).
-            try:
-                body2 = {
-                    "contents": body["contents"],
-                    "generationConfig": {
-                        "temperature": 0,
-                        "maxOutputTokens": 180,
-                        "responseMimeType": "application/json",
-                    },
-                }
-                with httpx.Client(timeout=self.timeout_s) as client:
-                    r2 = client.post(url, headers=headers, json=body2)
-                    r2.raise_for_status()
-                    data2 = r2.json()
-                text2 = _extract_candidate_text(data2)
-                out2 = _extract_json(text2)
-                if out2.get("action") not in {"BUY", "SELL", "WAIT", "EXIT"}:
-                    raise ValueError(f"invalid action: {out2.get('action')}")
-                if not isinstance(out2.get("targets"), list):
-                    raise ValueError("targets must be list")
-                out = out2
-            except Exception as e2:
-                store.close()
-                return {
-                    "action": "WAIT",
-                    "sl": None,
-                    "targets": [],
-                    "error": f"gemini_parse_error: {_sanitize_error(str(e))} / retry_failed: {_sanitize_error(str(e2))}",
-                }
+            # Salvage from raw text first (common when schema is dropped and JSON is truncated).
+            salv = _salvage_decision_from_text(_extract_candidate_text(data))
+            if salv is not None:
+                out = salv
+            else:
+                # One retry for parse errors: ask again with simpler settings (no schema, plain text JSON).
+                try:
+                    body2 = {
+                        "contents": body["contents"],
+                        "generationConfig": {
+                            "temperature": 0,
+                            "maxOutputTokens": 512,
+                            "responseMimeType": "application/json",
+                        },
+                    }
+                    with httpx.Client(timeout=self.timeout_s) as client:
+                        r2 = client.post(url, headers=headers, json=body2)
+                        r2.raise_for_status()
+                        data2 = r2.json()
+                    text2 = _extract_candidate_text(data2)
+                    out2 = _salvage_decision_from_text(text2) or _extract_json(text2)
+                    if out2.get("action") not in {"BUY", "SELL", "WAIT", "EXIT"}:
+                        raise ValueError(f"invalid action: {out2.get('action')}")
+                    if not isinstance(out2.get("targets"), list):
+                        raise ValueError("targets must be list")
+                    out = out2
+                except Exception as e2:
+                    store.close()
+                    return {
+                        "action": "WAIT",
+                        "sl": None,
+                        "targets": [],
+                        "error": f"gemini_parse_error: {_sanitize_error(str(e))} / retry_failed: {_sanitize_error(str(e2))}",
+                    }
 
         created_at = datetime.now(timezone.utc).isoformat()
         cache_id = f"gem_{req_hash[:16]}"

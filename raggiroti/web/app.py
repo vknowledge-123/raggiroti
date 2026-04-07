@@ -998,6 +998,9 @@ def gemini_list_models() -> JSONResponse:
 
 def _security_id_for_symbol(symbol: str) -> str:
     s = (symbol or "").upper().strip()
+    # Common user inputs
+    if s in {"NIFTY 50", "NIFTY50"}:
+        s = "NIFTY"
     if s == "NIFTY":
         return "13"
     if s in {"BANKNIFTY", "BANK_NIFTY"}:
@@ -1083,11 +1086,18 @@ def _start_live_thread(
         try:
             from dhanhq import marketfeed  # type: ignore
             sub_type = marketfeed.Full
-            exch = marketfeed.NSE
+            # Indices (NIFTY/BANKNIFTY) are on the IDX exchange segment in Dhan MarketFeed.
+            # Using NSE here will subscribe to an equity with the same security_id and produce wrong prices.
+            sym0 = (symbol or "").upper().strip()
+            if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"}:
+                exch = marketfeed.IDX
+            else:
+                exch = marketfeed.NSE
         except Exception:
             # Fallback defaults (may be wrong for some segments).
             sub_type = 2
-            exch = 1
+            sym0 = (symbol or "").upper().strip()
+            exch = 0 if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"} else 1
 
         feed = None
         try:

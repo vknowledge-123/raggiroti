@@ -103,6 +103,31 @@ class LiveSimEngine:
         self._prev = compute_prev_day_levels(prev_day_candles)
         self._sb.on_new_day(prev=self._prev)
 
+    def _force_exit_reason(self, state: dict) -> str | None:
+        """
+        Deterministic Dow-theory / structure based exit guard.
+        This is a safety layer so positions don't depend exclusively on LLM reliability.
+        """
+        pos = self._broker.position
+        if pos is None:
+            return None
+        s1 = str(state.get("dow_structure_1m") or "")
+        s5 = str(state.get("dow_structure_5m") or "")
+        broke_h = bool(state.get("broke_last_swing_high"))
+        broke_l = bool(state.get("broke_last_swing_low"))
+
+        if pos.side == "LONG":
+            if s5 == "bear":
+                return "DOW_FLIP_5M"
+            if broke_l and s1 == "bear":
+                return "SWING_LOW_BREAK_1M"
+        if pos.side == "SHORT":
+            if s5 == "bull":
+                return "DOW_FLIP_5M"
+            if broke_h and s1 == "bull":
+                return "SWING_HIGH_BREAK_1M"
+        return None
+
     async def on_candle_close(self, candle: LiveCandle) -> DecisionOut:
         async with self._lock:
             self._ensure_day_initialized(candle)
@@ -139,6 +164,35 @@ class LiveSimEngine:
 
             self._last_state = state
 
+            # Deterministic structure exit (Dow flip / swing break) BEFORE LLM call.
+            # This keeps latency low and ensures we exit even if Gemini fails.
+            forced = self._force_exit_reason(state)
+            if forced and self._broker.position is not None:
+                self._broker.exit(state["dt"], c.close, forced)
+                decision = DecisionOut(action="EXIT", sl=None, targets=[], raw={"action": "EXIT", "sl": None, "targets": [], "error": f"forced_exit:{forced}"})
+                self._candles.append(
+                    {
+                        "dt": state["dt"],
+                        "open": candle.open,
+                        "high": candle.high,
+                        "low": candle.low,
+                        "close": candle.close,
+                        "volume": candle.volume,
+                    }
+                )
+                self._decisions.append(
+                    {
+                        "dt": state["dt"],
+                        "action": decision.action,
+                        "sl": decision.sl,
+                        "targets": decision.targets,
+                        "pos": state["position"],
+                        "reason": forced,
+                        "raw": {k: v for k, v in (decision.raw or {}).items() if k in {"action", "sl", "targets", "error"}},
+                    }
+                )
+                return decision
+
             retrieved = retrieve_rulebook_rules(self._settings.rulebook_path, state, limit=25)
             out = self._gemini.decide(
                 state=state,
@@ -146,6 +200,19 @@ class LiveSimEngine:
             )
 
             decision = DecisionOut(action=str(out.get("action", "WAIT")), sl=out.get("sl"), targets=out.get("targets") or [], raw=out)
+            # Enforce: while in position, do NOT start a new position.
+            # - If Gemini outputs the opposite side, interpret as EXIT (structure change / invalidation).
+            # - If Gemini outputs same-side BUY/SELL, ignore as WAIT (hold).
+            pos = self._broker.position
+            override_reason: str | None = None
+            if pos is not None and decision.action in {"BUY", "SELL"}:
+                if (pos.side == "LONG" and decision.action == "SELL") or (pos.side == "SHORT" and decision.action == "BUY"):
+                    decision = DecisionOut(action="EXIT", sl=None, targets=[], raw={**(decision.raw or {}), "error": "override:opposite_signal_exit"})
+                    override_reason = "LLM_OPPOSITE_SIGNAL_EXIT"
+                else:
+                    decision = DecisionOut(action="WAIT", sl=None, targets=[], raw={**(decision.raw or {}), "error": "override:in_position_ignore_entry"})
+                    override_reason = "IN_POSITION_IGNORE_ENTRY"
+
             self._candles.append(
                 {
                     "dt": state["dt"],
@@ -163,6 +230,7 @@ class LiveSimEngine:
                     "sl": decision.sl,
                     "targets": decision.targets,
                     "pos": state["position"],
+                    "reason": override_reason,
                     "raw": {k: v for k, v in (decision.raw or {}).items() if k in {"action", "sl", "targets", "error"}},
                 }
             )
