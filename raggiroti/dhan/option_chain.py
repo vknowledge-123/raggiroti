@@ -42,6 +42,263 @@ def _to_float_india(x) -> float | None:
         return None
 
 
+def _unwrap_dhanhq(payload: object) -> object:
+    """
+    dhanhq client methods often return a wrapper:
+      {"status":"success|failure","remarks":...,"data":<payload>}
+    """
+    if isinstance(payload, dict) and "data" in payload:
+        try:
+            st = str(payload.get("status") or "").strip().lower()
+        except Exception:
+            st = ""
+        if st in {"success", "failure"}:
+            return payload.get("data")
+    return payload
+
+
+def _looks_like_leg_dict(v: object) -> bool:
+    if not isinstance(v, dict):
+        return False
+    for k in ("oi", "openInterest", "open_interest", "OI"):
+        if k in v and v.get(k) is not None:
+            return True
+    for k in ("oiChange", "changeinOpenInterest", "change_in_oi", "oi_change"):
+        if k in v and v.get(k) is not None:
+            return True
+    return False
+
+
+def _strike_from_any(d: dict) -> float | None:
+    return _to_float(d.get("strikePrice") or d.get("strike_price") or d.get("strike") or d.get("StrikePrice"))
+
+
+def _side_from_any(d: dict) -> str | None:
+    """
+    Returns "CE" or "PE" if the object looks like a single option leg row.
+    """
+    # Common explicit fields
+    for k in ("option_type", "optionType", "right", "side", "instrument_type", "cpType", "call_put", "callPut"):
+        if k in d and d.get(k) is not None:
+            s = str(d.get(k) or "").strip().upper()
+            if s in {"CE", "CALL", "C"}:
+                return "CE"
+            if s in {"PE", "PUT", "P"}:
+                return "PE"
+    # Fallback: infer from trading symbol if present.
+    for k in ("trading_symbol", "tradingsymbol", "symbol", "tsym", "instrument", "name"):
+        if k in d and d.get(k) is not None:
+            s = str(d.get(k) or "").upper()
+            # Keep this intentionally simple (avoid false positives from words like "PRICE").
+            if " CE" in s or s.endswith("CE") or re.search(r"\bCE\b", s):
+                return "CE"
+            if " PE" in s or s.endswith("PE") or re.search(r"\bPE\b", s):
+                return "PE"
+    return None
+
+
+def _leg_from_any(d: dict) -> dict:
+    """
+    Normalizes a single option-leg dict to our internal keys.
+    """
+    return {
+        "oi": _to_float(d.get("oi") or d.get("openInterest") or d.get("open_interest") or d.get("OI")) or 0.0,
+        "oiChange": _to_float(d.get("oiChange") or d.get("changeinOpenInterest") or d.get("change_in_oi") or d.get("oi_change")),
+        "ltp": _to_float(d.get("ltp") or d.get("lastPrice") or d.get("LTP") or d.get("lp")),
+        "volume": _to_float(d.get("volume") or d.get("Volume")),
+    }
+
+
+def _merge_leg_rows(legs: list[dict]) -> list[dict] | None:
+    """
+    Some APIs return a flat list where each row is a single option leg
+    (strike + CE/PE + oi fields). Merge those into strike rows:
+      {"strikePrice":..., "CE":{...}, "PE":{...}}
+    """
+    if not isinstance(legs, list) or not legs:
+        return None
+    out: dict[float, dict] = {}
+    any_leg = False
+    for x in legs:
+        if not isinstance(x, dict):
+            continue
+        strike = _strike_from_any(x)
+        if strike is None:
+            continue
+        side = _side_from_any(x)
+        if side not in {"CE", "PE"}:
+            continue
+        any_leg = True
+        st = float(strike)
+        row = out.get(st) or {"strikePrice": st}
+        row[side] = _leg_from_any(x)
+        out[st] = row
+    if not any_leg:
+        return None
+    return [out[k] for k in sorted(out.keys())]
+
+
+def _extract_option_rows_any(payload: object, *, max_nodes: int = 3000) -> list[dict] | None:
+    """
+    Best-effort extraction of option-chain strike rows as a list[dict] from different vendor shapes.
+    Keeps traversal bounded.
+    """
+    payload = _unwrap_dhanhq(payload)
+
+    # Common direct keys.
+    if isinstance(payload, dict):
+        # Some vendors keep CE/PE as two lists under separate keys.
+        for ck, pk in (
+            ("CE", "PE"),
+            ("ce", "pe"),
+            ("calls", "puts"),
+            ("call", "put"),
+            ("CALL", "PUT"),
+        ):
+            c = payload.get(ck)
+            p = payload.get(pk)
+            if isinstance(c, list) and isinstance(p, list):
+                merged = _merge_leg_rows([*c, *p])
+                if merged:
+                    return merged
+        for k in ("data", "Data", "option_data", "optionData"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                # First, see if these are already strike rows.
+                rows = [x for x in v if isinstance(x, dict)]
+                if rows:
+                    # If list contains flat leg rows, merge.
+                    merged = _merge_leg_rows(rows)
+                    if merged:
+                        return merged
+                    return rows
+            if isinstance(v, dict):
+                # Sometimes nested dict holds CE/PE lists.
+                merged = _extract_option_rows_any(v, max_nodes=max_nodes)
+                if merged:
+                    return merged
+        # NSE records.data
+        rec = payload.get("records")
+        if isinstance(rec, dict) and isinstance(rec.get("data"), list):
+            rows = [x for x in rec.get("data") if isinstance(x, dict)]
+            if rows:
+                merged = _merge_leg_rows(rows)
+                if merged:
+                    return merged
+                return rows
+
+    def _looks_like_row(x: object) -> bool:
+        if not isinstance(x, dict):
+            return False
+        strike = x.get("strikePrice") or x.get("strike_price") or x.get("strike") or x.get("StrikePrice")
+        if strike is None:
+            return False
+        # Any leg present
+        if _looks_like_leg_dict(x.get("CE")) or _looks_like_leg_dict(x.get("PE")):
+            return True
+        if _looks_like_leg_dict(x.get("ce")) or _looks_like_leg_dict(x.get("pe")):
+            return True
+        if _looks_like_leg_dict(x.get("call")) or _looks_like_leg_dict(x.get("put")):
+            return True
+        # Generic nested dict looks like leg.
+        for v in x.values():
+            if _looks_like_leg_dict(v):
+                return True
+        # Flat leg row (strike + oi + side)
+        if _side_from_any(x) in {"CE", "PE"} and _looks_like_leg_dict(x):
+            return True
+        return False
+
+    # Bounded BFS/DFS for nested payloads.
+    seen = 0
+    stack = [payload]
+    while stack and seen < int(max_nodes):
+        cur = stack.pop()
+        seen += 1
+        cur = _unwrap_dhanhq(cur)
+        if isinstance(cur, list):
+            sample = cur[:25]
+            if sample:
+                # If list already looks like strike rows (or flat leg rows), return it/merge it.
+                if any(_looks_like_row(x) for x in sample):
+                    rows = [x for x in cur if isinstance(x, dict)]
+                    if rows:
+                        merged = _merge_leg_rows(rows)
+                        if merged:
+                            return merged
+                        return rows
+                # Otherwise, still try merging (some feeds don't have clear CE/PE nesting).
+                rows = [x for x in cur if isinstance(x, dict)]
+                merged = _merge_leg_rows(rows)
+                if merged:
+                    return merged
+            for x in sample:
+                stack.append(x)
+            continue
+        if isinstance(cur, dict):
+            for v in list(cur.values())[:80]:
+                stack.append(v)
+            continue
+    return None
+
+
+def summarize_oi_snapshot_any(payload: dict, *, spot_price: float, strikes_each_side: int = 5, top_n_walls: int = 5) -> dict:
+    """
+    Live-simulation friendly OI snapshot:
+    - Always tries to compact to (2N+1) strikes around spot.
+    - Also includes ce_walls/pe_walls computed from the window so downstream
+      code (derive_oi_features) keeps working without special-casing.
+    """
+    win = summarize_oi_window_any(payload, spot_price=float(spot_price), strikes_each_side=int(strikes_each_side))
+    if not isinstance(win, dict) or not win.get("ok"):
+        # Fallback to global walls if we couldn't build a window.
+        return summarize_oi_walls_any(payload, top_n=int(top_n_walls))
+
+    ce: list[OIWall] = []
+    pe: list[OIWall] = []
+    for row in win.get("window") or []:
+        if not isinstance(row, dict):
+            continue
+        strike = _to_float(row.get("strike"))
+        if strike is None:
+            continue
+        ce_leg = row.get("CE") if isinstance(row.get("CE"), dict) else None
+        pe_leg = row.get("PE") if isinstance(row.get("PE"), dict) else None
+        if ce_leg is not None:
+            ce.append(
+                OIWall(
+                    strike=float(strike),
+                    side="CE",
+                    oi=float(_to_float(ce_leg.get("oi")) or 0.0),
+                    oi_change=_to_float(ce_leg.get("oi_change")),
+                    ltp=_to_float(ce_leg.get("ltp")),
+                )
+            )
+        if pe_leg is not None:
+            pe.append(
+                OIWall(
+                    strike=float(strike),
+                    side="PE",
+                    oi=float(_to_float(pe_leg.get("oi")) or 0.0),
+                    oi_change=_to_float(pe_leg.get("oi_change")),
+                    ltp=_to_float(pe_leg.get("ltp")),
+                )
+            )
+
+    ce_sorted = sorted(ce, key=lambda x: x.oi, reverse=True)[: int(top_n_walls)]
+    pe_sorted = sorted(pe, key=lambda x: x.oi, reverse=True)[: int(top_n_walls)]
+
+    return {
+        "ok": True,
+        "mode": "window",
+        "spot": win.get("spot"),
+        "atm_strike": win.get("atm_strike"),
+        "window": win.get("window"),
+        "ce_walls": [w.__dict__ for w in ce_sorted],
+        "pe_walls": [w.__dict__ for w in pe_sorted],
+    }
+
+
 class DhanOptionChainClient:
     def __init__(self, *, client_id: str, access_token: str) -> None:
         """
@@ -87,29 +344,9 @@ def summarize_oi_walls(option_chain_resp: dict, top_n: int = 5) -> dict:
     Converts the full option chain payload into a compact OI "wall" summary.
     Assumes response contains strike rows with CE/PE legs (common in Dhan).
     """
-    def _coerce_rows(obj: object) -> list[dict] | None:
-        if isinstance(obj, list):
-            # keep dict rows only
-            rows0 = [x for x in obj if isinstance(x, dict)]
-            return rows0 if rows0 else None
-        if isinstance(obj, dict):
-            # common keys
-            for k in ("data", "Data", "option_data", "optionData", "records", "result", "payload"):
-                if k in obj:
-                    out = _coerce_rows(obj.get(k))
-                    if out is not None:
-                        return out
-            # NSE records.data style
-            rec = obj.get("records")
-            if isinstance(rec, dict) and "data" in rec:
-                out = _coerce_rows(rec.get("data"))
-                if out is not None:
-                    return out
-        return None
-
-    rows = _coerce_rows(option_chain_resp)
+    rows = _extract_option_rows_any(option_chain_resp)
     if not isinstance(rows, list):
-        return {"ok": False, "error": "unexpected option_chain format", "raw_keys": list(option_chain_resp.keys())[:20]}
+        return {"ok": False, "error": "unexpected option_chain format", "raw_keys": list(option_chain_resp.keys())[:20] if isinstance(option_chain_resp, dict) else []}
 
     ce: list[OIWall] = []
     pe: list[OIWall] = []
@@ -165,13 +402,11 @@ def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
 
     # dhanhq wrapper: unwrap recursively
     try:
-        if isinstance(payload, dict) and payload.get("status") in {"success", "failure"} and "data" in payload:
-            inner = payload.get("data")
-            if isinstance(inner, dict):
-                return summarize_oi_walls_any(inner, top_n=top_n)
-            if isinstance(inner, list):
-                # Some wrappers may return the list directly.
-                return summarize_oi_walls({"data": inner}, top_n=top_n)
+        inner = _unwrap_dhanhq(payload)
+        if inner is not payload and isinstance(inner, dict):
+            return summarize_oi_walls_any(inner, top_n=top_n)
+        if isinstance(inner, list):
+            return summarize_oi_walls({"data": inner}, top_n=top_n)
     except Exception:
         pass
 
@@ -186,85 +421,67 @@ def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
     except Exception:
         pass
 
-    def _looks_like_strike_row(x: object) -> bool:
-        if not isinstance(x, dict):
-            return False
-        if x.get("strikePrice") is not None or x.get("strike_price") is not None or x.get("strike") is not None:
-            return True
-        # Some vendors nest strike under a key.
-        if isinstance(x.get("StrikePrice"), (int, float, str)):
-            return True
-        return False
-
-    def _looks_like_leg_dict(v: object) -> bool:
-        if not isinstance(v, dict):
-            return False
-        # Common OI keys across vendors.
-        for k in ("oi", "openInterest", "open_interest", "OI"):
-            if k in v and v.get(k) is not None:
-                return True
-        # Sometimes only change-in-OI is present.
-        for k in ("oiChange", "changeinOpenInterest", "change_in_oi", "oi_change"):
-            if k in v and v.get(k) is not None:
-                return True
-        return False
-
-    def _looks_like_option_row(x: object) -> bool:
-        if not isinstance(x, dict):
-            return False
-        if not _looks_like_strike_row(x):
-            return False
-        # Common legs
-        if _looks_like_leg_dict(x.get("CE")) or _looks_like_leg_dict(x.get("PE")):
-            return True
-        if _looks_like_leg_dict(x.get("ce")) or _looks_like_leg_dict(x.get("pe")):
-            return True
-        if _looks_like_leg_dict(x.get("call")) or _looks_like_leg_dict(x.get("put")):
-            return True
-        if _looks_like_leg_dict(x.get("CALL")) or _looks_like_leg_dict(x.get("PUT")):
-            return True
-        if _looks_like_leg_dict(x.get("Call")) or _looks_like_leg_dict(x.get("Put")):
-            return True
-        # Generic: any nested dict looks like a leg.
-        for v in x.values():
-            if _looks_like_leg_dict(v):
-                return True
-        return False
-
-    def _find_option_rows(obj: object, max_nodes: int = 2000) -> list[dict] | None:
-        """
-        Best-effort search for the strike-rows list inside deeply nested payloads.
-        Keeps traversal bounded to avoid scanning huge responses indefinitely.
-        """
-        seen = 0
-        stack = [obj]
-        while stack and seen < max_nodes:
-            cur = stack.pop()
-            seen += 1
-            if isinstance(cur, list):
-                # check a small prefix
-                sample = cur[:20]
-                if sample and any(_looks_like_option_row(x) for x in sample):
-                    # filter only dict rows
-                    return [x for x in cur if isinstance(x, dict)]
-                # else traverse elements (bounded)
-                for x in sample:
-                    stack.append(x)
-                continue
-            if isinstance(cur, dict):
-                for v in list(cur.values())[:60]:
-                    stack.append(v)
-        return None
-
     # Dhan / other nested shapes: locate the strike rows list anywhere in the payload.
     try:
-        rows = _find_option_rows(payload)
+        rows = _extract_option_rows_any(payload)
         if isinstance(rows, list) and rows:
             return summarize_oi_walls({"data": rows}, top_n=top_n)
     except Exception:
         pass
 
     return summarize_oi_walls(payload, top_n=top_n)
+
+
+def summarize_oi_window_any(payload: dict, *, spot_price: float, strikes_each_side: int = 5) -> dict:
+    """
+    Compact snapshot around spot:
+      - ATM strike
+      - N strikes below + N strikes above (plus ATM) => total 2N+1
+    Output shape is intentionally small for LLM prompts.
+    """
+    rows = _extract_option_rows_any(payload)
+    if not isinstance(rows, list) or not rows:
+        return {"ok": False, "error": "unexpected option_chain format"}
+
+    # Map strike -> row
+    strike_to_row: dict[float, dict] = {}
+    strikes: list[float] = []
+    for r in rows:
+        strike = _to_float(r.get("strikePrice") or r.get("strike_price") or r.get("strike") or r.get("StrikePrice"))
+        if strike is None:
+            continue
+        strike = float(strike)
+        strike_to_row[strike] = r
+        strikes.append(strike)
+    strikes = sorted(set(strikes))
+    if not strikes:
+        return {"ok": False, "error": "no_strikes"}
+
+    sp = float(spot_price)
+    atm = min(strikes, key=lambda x: abs(x - sp))
+    i = strikes.index(atm)
+    lo = max(0, i - int(strikes_each_side))
+    hi = min(len(strikes), i + int(strikes_each_side) + 1)
+    sel = strikes[lo:hi]
+
+    def _leg(d: object) -> dict | None:
+        if not isinstance(d, dict):
+            return None
+        return {
+            "oi": _to_float(d.get("oi") or d.get("openInterest") or d.get("open_interest") or d.get("OI")),
+            "oi_change": _to_float(d.get("oiChange") or d.get("changeinOpenInterest") or d.get("change_in_oi") or d.get("oi_change")),
+            "ltp": _to_float(d.get("ltp") or d.get("lastPrice") or d.get("LTP")),
+            "volume": _to_float(d.get("volume") or d.get("Volume")),
+        }
+
+    window = []
+    for s in sel:
+        r = strike_to_row.get(s) or {}
+        ce_leg = r.get("CE") or r.get("ce") or r.get("call") or r.get("CALL") or r.get("Call") or {}
+        pe_leg = r.get("PE") or r.get("pe") or r.get("put") or r.get("PUT") or r.get("Put") or {}
+        window.append({"strike": float(s), "CE": _leg(ce_leg), "PE": _leg(pe_leg)})
+
+    return {"ok": True, "spot": sp, "atm_strike": float(atm), "window": window}
 
 
 def summarize_oi_walls_plaintext(text: str, top_n: int = 5) -> dict:

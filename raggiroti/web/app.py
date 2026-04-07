@@ -40,6 +40,7 @@ from raggiroti.dhan.option_chain import (
     summarize_oi_walls,
     summarize_oi_walls_any,
     summarize_oi_walls_plaintext,
+    summarize_oi_snapshot_any,
 )
 from raggiroti.live.candle_builder import CandleBuilder1m
 from raggiroti.live.models import Tick
@@ -1469,7 +1470,25 @@ def _start_live_thread(
                     continue
 
                 # Use the robust parser that supports dhanhq wrapper responses.
-                summary = summarize_oi_walls_any(chain, top_n=5)
+                spot = None
+                try:
+                    spot = float(LIVE_LAST_TICK_LTP) if LIVE_LAST_TICK_LTP is not None else None
+                except Exception:
+                    spot = None
+                if spot is None:
+                    try:
+                        st0 = LIVE_ENGINE.last_state() if LIVE_ENGINE is not None else None
+                        if isinstance(st0, dict) and st0.get("price") is not None:
+                            spot = float(st0.get("price"))
+                    except Exception:
+                        spot = None
+
+                # Prefer a compact (ATM +/- N strikes) snapshot for LLM prompts.
+                summary = (
+                    summarize_oi_snapshot_any(chain, spot_price=float(spot), strikes_each_side=5, top_n_walls=5)
+                    if spot is not None
+                    else summarize_oi_walls_any(chain, top_n=5)
+                )
                 if summary.get("ok"):
                     LIVE_OI_SNAPSHOT = summary
                     LIVE_OI_UPDATED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
