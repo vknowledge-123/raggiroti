@@ -1349,13 +1349,13 @@ def _start_live_thread(
                     if str(e).startswith("non_ltp_packet:"):
                         return
                     try:
-                        _push_live_error("tick_parse_error", {"keys": list((msg or {}).keys())[:12]})
+                        _push_live_error("tick_parse_error", _compact_tick_msg(msg))
                     except Exception:
                         _push_live_error("tick_parse_error", "parse_marketfeed_tick_failed")
                     return
                 except Exception:
                     try:
-                        _push_live_error("tick_parse_error", {"keys": list((msg or {}).keys())[:12]})
+                        _push_live_error("tick_parse_error", _compact_tick_msg(msg))
                     except Exception:
                         _push_live_error("tick_parse_error", "parse_marketfeed_tick_failed")
                     return
@@ -1482,6 +1482,14 @@ def _start_live_thread(
                             spot = float(st0.get("price"))
                     except Exception:
                         spot = None
+                if spot is None:
+                    # Dhan option_chain often includes underlying spot as "last_price" in the payload itself.
+                    try:
+                        inner = chain.get("data") if isinstance(chain, dict) and isinstance(chain.get("data"), dict) else chain
+                        if isinstance(inner, dict) and inner.get("last_price") is not None:
+                            spot = float(inner.get("last_price"))
+                    except Exception:
+                        spot = None
 
                 # Prefer a compact (ATM +/- N strikes) snapshot for LLM prompts.
                 summary = (
@@ -1568,13 +1576,20 @@ def live_start(
         except Exception:
             pass
         try:
-            t0.join(timeout=1.2)
+            t0.join(timeout=4.0)
         except Exception:
             pass
 
     with LIVE_LOCK:
+        if LIVE_THREAD is not None and LIVE_THREAD.is_alive() and LIVE_ENGINE is not None and not LIVE_STOP.is_set():
+            # Idempotent start: if already running, return success + status instead of 400.
+            try:
+                st = LIVE_ENGINE.status()
+                return JSONResponse({"ok": True, "already_running": True, "status": asdict(st), "feed_config": LIVE_FEED_CONFIG})
+            except Exception:
+                return JSONResponse({"ok": True, "already_running": True, "feed_config": LIVE_FEED_CONFIG})
         if LIVE_THREAD is not None and LIVE_THREAD.is_alive():
-            return JSONResponse({"ok": False, "error": "live already running"}, status_code=400)
+            return JSONResponse({"ok": False, "error": "live stopping; try again in a few seconds"}, status_code=400)
         if LIVE_LOOP is None:
             return JSONResponse({"ok": False, "error": "server loop not ready"}, status_code=500)
         _start_live_thread(
@@ -1634,15 +1649,17 @@ def live_start(
 
 @app.post("/api/live/stop")
 def live_stop() -> JSONResponse:
-    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR, LIVE_FEED, LIVE_THREAD
+    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR, LIVE_FEED, LIVE_THREAD, LIVE_OI_THREAD
     LIVE_STOP.set()
     # Best-effort: disconnect websocket to unblock run_forever() so the thread can exit quickly.
     t0: threading.Thread | None = None
+    t_oi: threading.Thread | None = None
     try:
         with LIVE_LOCK:
             if LIVE_FEED is not None:
                 LIVE_FEED.disconnect()
             t0 = LIVE_THREAD
+            t_oi = LIVE_OI_THREAD
     except Exception:
         pass
     with LIVE_LOCK:
@@ -1670,12 +1687,16 @@ def live_stop() -> JSONResponse:
         pass
     try:
         if t0 is not None and t0.is_alive():
-            t0.join(timeout=1.2)
+            t0.join(timeout=4.0)
+        if t_oi is not None and t_oi.is_alive():
+            t_oi.join(timeout=2.0)
     except Exception:
         pass
     with LIVE_LOCK:
         if LIVE_THREAD is not None and not LIVE_THREAD.is_alive():
             LIVE_THREAD = None
+        if LIVE_OI_THREAD is not None and not LIVE_OI_THREAD.is_alive():
+            LIVE_OI_THREAD = None
     return JSONResponse({"ok": True})
 
 

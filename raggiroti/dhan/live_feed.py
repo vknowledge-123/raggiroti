@@ -140,9 +140,16 @@ def parse_marketfeed_tick(msg: dict) -> tuple[str, float, float | None, datetime
     data = msg.get("Data") if isinstance(msg.get("Data"), dict) else msg
     if not isinstance(data, dict):
         data = {}
-    sec = str(data.get("security_id") or data.get("SecurityId") or data.get("securityId") or "")
+    sec_raw = data.get("security_id") or data.get("SecurityId") or data.get("securityId") or data.get("SecurityID")
+    try:
+        if isinstance(sec_raw, (int, float)) and sec_raw is not None:
+            sec = str(int(sec_raw))
+        else:
+            sec = str(sec_raw or "")
+    except Exception:
+        sec = str(sec_raw or "")
 
-    ltp = _pick(data, ["LTP", "ltp", "last_traded_price", "LastTradedPrice", "lastTradedPrice"])
+    ltp = _pick(data, ["LTP", "ltp", "lp", "LP", "last_price", "LastPrice", "lastPrice", "last_traded_price", "LastTradedPrice", "lastTradedPrice"])
     if ltp is None:
         # MarketFeed also emits non-trade packets (prev_close / status / OI etc).
         # These do not contain LTP and should be ignored by candle builders.

@@ -101,10 +101,20 @@ def _leg_from_any(d: dict) -> dict:
     """
     Normalizes a single option-leg dict to our internal keys.
     """
+    oi = _to_float(d.get("oi") or d.get("openInterest") or d.get("open_interest") or d.get("OI")) or 0.0
+    oi_change = _to_float(d.get("oiChange") or d.get("changeinOpenInterest") or d.get("change_in_oi") or d.get("oi_change"))
+    if oi_change is None:
+        # Dhan REST often gives: oi + previous_oi (start-of-day OI). Derive change.
+        prev = _to_float(d.get("previous_oi") or d.get("prev_oi") or d.get("prevOI") or d.get("prev_OI"))
+        if prev is not None:
+            try:
+                oi_change = float(oi - float(prev))
+            except Exception:
+                oi_change = None
     return {
-        "oi": _to_float(d.get("oi") or d.get("openInterest") or d.get("open_interest") or d.get("OI")) or 0.0,
-        "oiChange": _to_float(d.get("oiChange") or d.get("changeinOpenInterest") or d.get("change_in_oi") or d.get("oi_change")),
-        "ltp": _to_float(d.get("ltp") or d.get("lastPrice") or d.get("LTP") or d.get("lp")),
+        "oi": oi,
+        "oiChange": oi_change,
+        "ltp": _to_float(d.get("ltp") or d.get("last_price") or d.get("lastPrice") or d.get("LTP") or d.get("lp")),
         "volume": _to_float(d.get("volume") or d.get("Volume")),
     }
 
@@ -370,6 +380,19 @@ def summarize_oi_walls(option_chain_resp: dict, top_n: int = 5) -> dict:
     if not isinstance(rows, list):
         return {"ok": False, "error": "unexpected option_chain format", "raw_keys": list(option_chain_resp.keys())[:20] if isinstance(option_chain_resp, dict) else []}
 
+    def _leg_vals(leg: dict) -> tuple[float, float | None, float | None]:
+        oi = _to_float(leg.get("oi") or leg.get("openInterest") or leg.get("open_interest") or leg.get("OI")) or 0.0
+        chg = _to_float(leg.get("oiChange") or leg.get("changeinOpenInterest") or leg.get("change_in_oi") or leg.get("oi_change"))
+        if chg is None:
+            prev = _to_float(leg.get("previous_oi") or leg.get("prev_oi") or leg.get("prevOI") or leg.get("prev_OI"))
+            if prev is not None:
+                try:
+                    chg = float(oi - float(prev))
+                except Exception:
+                    chg = None
+        ltp = _to_float(leg.get("ltp") or leg.get("last_price") or leg.get("lastPrice") or leg.get("LTP") or leg.get("lp"))
+        return float(oi), chg, ltp
+
     ce: list[OIWall] = []
     pe: list[OIWall] = []
     for r in rows:
@@ -381,23 +404,25 @@ def summarize_oi_walls(option_chain_resp: dict, top_n: int = 5) -> dict:
         ce_leg = r.get("CE") or r.get("ce") or r.get("call") or {}
         pe_leg = r.get("PE") or r.get("pe") or r.get("put") or {}
         if isinstance(ce_leg, dict):
+            oi, chg, ltp = _leg_vals(ce_leg)
             ce.append(
                 OIWall(
                     strike=strike,
                     side="CE",
-                    oi=_to_float(ce_leg.get("oi") or ce_leg.get("openInterest") or ce_leg.get("open_interest") or 0.0) or 0.0,
-                    oi_change=_to_float(ce_leg.get("oiChange") or ce_leg.get("changeinOpenInterest") or ce_leg.get("change_in_oi")),
-                    ltp=_to_float(ce_leg.get("ltp") or ce_leg.get("lastPrice")),
+                    oi=oi,
+                    oi_change=chg,
+                    ltp=ltp,
                 )
             )
         if isinstance(pe_leg, dict):
+            oi, chg, ltp = _leg_vals(pe_leg)
             pe.append(
                 OIWall(
                     strike=strike,
                     side="PE",
-                    oi=_to_float(pe_leg.get("oi") or pe_leg.get("openInterest") or pe_leg.get("open_interest") or 0.0) or 0.0,
-                    oi_change=_to_float(pe_leg.get("oiChange") or pe_leg.get("changeinOpenInterest") or pe_leg.get("change_in_oi")),
-                    ltp=_to_float(pe_leg.get("ltp") or pe_leg.get("lastPrice")),
+                    oi=oi,
+                    oi_change=chg,
+                    ltp=ltp,
                 )
             )
 
@@ -489,10 +514,19 @@ def summarize_oi_window_any(payload: dict, *, spot_price: float, strikes_each_si
     def _leg(d: object) -> dict | None:
         if not isinstance(d, dict):
             return None
+        oi = _to_float(d.get("oi") or d.get("openInterest") or d.get("open_interest") or d.get("OI"))
+        chg = _to_float(d.get("oiChange") or d.get("changeinOpenInterest") or d.get("change_in_oi") or d.get("oi_change"))
+        if chg is None and oi is not None:
+            prev = _to_float(d.get("previous_oi") or d.get("prev_oi") or d.get("prevOI") or d.get("prev_OI"))
+            if prev is not None:
+                try:
+                    chg = float(float(oi) - float(prev))
+                except Exception:
+                    chg = None
         return {
-            "oi": _to_float(d.get("oi") or d.get("openInterest") or d.get("open_interest") or d.get("OI")),
-            "oi_change": _to_float(d.get("oiChange") or d.get("changeinOpenInterest") or d.get("change_in_oi") or d.get("oi_change")),
-            "ltp": _to_float(d.get("ltp") or d.get("lastPrice") or d.get("LTP")),
+            "oi": oi,
+            "oi_change": chg,
+            "ltp": _to_float(d.get("ltp") or d.get("last_price") or d.get("lastPrice") or d.get("LTP") or d.get("lp")),
             "volume": _to_float(d.get("volume") or d.get("Volume")),
         }
 
