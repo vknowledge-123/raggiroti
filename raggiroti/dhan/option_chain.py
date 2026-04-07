@@ -147,6 +147,28 @@ def _extract_option_rows_any(payload: object, *, max_nodes: int = 3000) -> list[
 
     # Common direct keys.
     if isinstance(payload, dict):
+        # Some APIs return a compact strike->legs map under "oc" (option chain):
+        # {"last_price": ..., "oc": {"22500": {"ce": {...}, "pe": {...}}, ...}}
+        oc_map = payload.get("oc") or payload.get("OC")
+        if isinstance(oc_map, dict) and oc_map:
+            rows: list[dict] = []
+            for k, v in oc_map.items():
+                strike = _to_float(k)
+                if strike is None:
+                    continue
+                if not isinstance(v, dict):
+                    continue
+                ce_leg = v.get("ce") or v.get("CE") or v.get("call") or v.get("CALL") or {}
+                pe_leg = v.get("pe") or v.get("PE") or v.get("put") or v.get("PUT") or {}
+                row = {"strikePrice": float(strike)}
+                if isinstance(ce_leg, dict):
+                    row["CE"] = ce_leg
+                if isinstance(pe_leg, dict):
+                    row["PE"] = pe_leg
+                rows.append(row)
+            if rows:
+                return rows
+
         # Some vendors keep CE/PE as two lists under separate keys.
         for ck, pk in (
             ("CE", "PE"),
