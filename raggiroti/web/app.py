@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -12,7 +13,6 @@ from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from datetime import timedelta
 
 import anyio
 from fastapi import FastAPI, Form, Request, Query
@@ -76,7 +76,8 @@ class PredictJob:
 
 PREDICT_JOBS: dict[str, PredictJob] = {}
 
-LIVE_LOCK = threading.Lock()
+# Re-entrant because some helpers called under the lock also touch live globals.
+LIVE_LOCK = threading.RLock()
 LIVE_THREAD: threading.Thread | None = None
 LIVE_OI_THREAD: threading.Thread | None = None
 LIVE_FEED: DhanLiveFeed | None = None
@@ -95,6 +96,8 @@ LIVE_TICK_COUNT = 0
 LIVE_LAST_TICK_AT: str | None = None
 LIVE_LAST_TICK_LTP: float | None = None
 LIVE_FEED_CONFIG: dict | None = None
+LIVE_SEED_THREAD: threading.Thread | None = None
+LIVE_SEED_STATUS: dict | None = None
 
 SIM_ENGINE: LiveSimEngine | None = None
 
@@ -167,18 +170,25 @@ def _set_gemini_settings(db_path: str, api_key: str, decision_model: str, extrac
 
 def _get_gemini_settings(db_path: str) -> dict:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    # Allow containerized deployments to provide secrets via env (no SQLite persistence required).
+    env_key = (os.getenv("GEMINI_API_KEY") or "").strip() or None
+    env_model = (os.getenv("GEMINI_DECISION_MODEL") or os.getenv("GEMINI_MODEL") or "").strip() or None
     conn = sqlite3.connect(db_path)
     _ensure_gemini_table(conn)
     cur = conn.execute("SELECT updated_at, api_key, model, decision_model, extract_model FROM gemini_settings WHERE id=1")
     row = cur.fetchone()
     conn.close()
-    if not row:
+    if not row and not env_key and not env_model:
         return {"updated_at": None, "api_key_masked": None, "model": None, "decision_model": None, "extract_model": None}
     k = row[1]
     masked = None
     if k:
         masked = ("*" * max(0, len(k) - 4)) + k[-4:]
     model = row[2]
+    if not masked and env_key:
+        masked = ("*" * max(0, len(env_key) - 4)) + env_key[-4:]
+    # Prefer env override for display if DB empty.
+    model = model or env_model
     return {
         "updated_at": row[0],
         "api_key_masked": masked,
@@ -189,6 +199,9 @@ def _get_gemini_settings(db_path: str) -> dict:
 
 
 def _get_gemini_api_key_raw(db_path: str) -> str | None:
+    env_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if env_key:
+        return env_key
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     _ensure_gemini_table(conn)
@@ -199,6 +212,9 @@ def _get_gemini_api_key_raw(db_path: str) -> str | None:
 
 
 def _get_gemini_decision_model_raw(db_path: str) -> str | None:
+    env_model = (os.getenv("GEMINI_DECISION_MODEL") or os.getenv("GEMINI_MODEL") or "").strip()
+    if env_model:
+        return env_model
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     _ensure_gemini_table(conn)
@@ -255,21 +271,28 @@ def _set_dhan_settings(db_path: str, client_id: str, access_token: str) -> None:
 
 def _get_dhan_settings(db_path: str) -> dict:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    env_client_id = (os.getenv("DHAN_CLIENT_ID") or "").strip() or None
+    env_token = (os.getenv("DHAN_ACCESS_TOKEN") or "").strip() or None
     conn = sqlite3.connect(db_path)
     _ensure_settings_table(conn)
     cur = conn.execute("SELECT updated_at, client_id, access_token FROM dhan_settings WHERE id=1")
     row = cur.fetchone()
     conn.close()
-    if not row:
+    if not row and not env_client_id and not env_token:
         return {"updated_at": None, "client_id": None, "access_token": None}
     token = row[2]
     masked = None
     if token:
         masked = ("*" * max(0, len(token) - 4)) + token[-4:]
-    return {"updated_at": row[0], "client_id": row[1], "access_token_masked": masked}
+    if not masked and env_token:
+        masked = ("*" * max(0, len(env_token) - 4)) + env_token[-4:]
+    return {"updated_at": row[0], "client_id": row[1] or env_client_id, "access_token_masked": masked}
 
 
 def _get_dhan_access_token_raw(db_path: str) -> str | None:
+    env_token = (os.getenv("DHAN_ACCESS_TOKEN") or "").strip()
+    if env_token:
+        return env_token
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     _ensure_settings_table(conn)
@@ -280,6 +303,9 @@ def _get_dhan_access_token_raw(db_path: str) -> str | None:
 
 
 def _get_dhan_client_id_raw(db_path: str) -> str | None:
+    env_client_id = (os.getenv("DHAN_CLIENT_ID") or "").strip()
+    if env_client_id:
+        return env_client_id
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     _ensure_settings_table(conn)
@@ -569,7 +595,7 @@ def home() -> str:
 
     <div class="card">
       <h3>Live Simulation (Paper Trades Only)</h3>
-      <form id="livef">
+      <form id="livef" method="post" action="/api/live/start" onsubmit="event.preventDefault(); liveStart();">
         <label>Symbol</label>
         <input name="symbol" value="NIFTY" />
         <label>Quantity</label>
@@ -577,7 +603,7 @@ def home() -> str:
         <label>Seed previous trading day (Dhan)</label>
         <input name="seed_prev_day" type="number" value="1" />
         <div style="margin-top:12px;">
-          <button type="button" onclick="liveStart()">Start Live</button>
+          <button type="submit">Start Live</button>
           <button type="button" onclick="liveStop()">Stop</button>
           <button type="button" onclick="liveStatus()">Status</button>
           <button type="button" onclick="liveState()">State</button>
@@ -1119,6 +1145,8 @@ def _start_live_thread(
     LIVE_OI_SNAPSHOT = None
     LIVE_OI_UPDATED_AT = None
     LIVE_OI_LAST_ERROR = None
+    global LIVE_SEED_STATUS
+    LIVE_SEED_STATUS = None
     with LIVE_LOCK:
         LIVE_FEED = None
     LIVE_ENGINE = LiveSimEngine(symbol=symbol, security_id=security_id, gemini_api_key=gemini_key, gemini_model=gemini_model, qty=qty)
@@ -1301,25 +1329,30 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
     client_id = _get_dhan_client_id_raw(settings.db_path)
     access_token = _get_dhan_access_token_raw(settings.db_path)
     if not client_id or not access_token:
-        return JSONResponse({"ok": False, "error": "missing dhan settings"}, status_code=400)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "missing dhan settings",
+                "hint": "Set via UI (/api/settings/dhan) or env vars DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN. Persist /app/data volume in Docker.",
+                "db_path": settings.db_path,
+            },
+            status_code=400,
+        )
 
     gemini_key = _get_gemini_api_key_raw(settings.db_path)
     gemini_model = _get_gemini_model_raw(settings.db_path) or "gemini-2.0-flash"
     if not gemini_key:
-        return JSONResponse({"ok": False, "error": "missing gemini api key"}, status_code=400)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "missing gemini api key",
+                "hint": "Set via UI (/api/settings/gemini) or env var GEMINI_API_KEY. Persist /app/data volume in Docker.",
+                "db_path": settings.db_path,
+            },
+            status_code=400,
+        )
 
     sec = _security_id_for_symbol(symbol)
-    seed_info = None
-    prev_day_candles = None
-    prev_day_date = None
-    if int(seed_prev_day) == 1:
-        try:
-            out = _fetch_prev_trading_day_candles(security_id=sec, access_token=access_token)
-            if out is not None:
-                prev_day_date, prev_day_candles = out
-                seed_info = {"prev_day_date": prev_day_date, "candles": len(prev_day_candles)}
-        except Exception as e:
-            seed_info = {"error": str(e)}
 
     # If a previous run is still stopping, attempt a best-effort disconnect+join so restart works.
     t0: threading.Thread | None = None
@@ -1352,9 +1385,36 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
             gemini_key=gemini_key,
             gemini_model=gemini_model,
             qty=int(qty),
-            prev_day_candles=prev_day_candles,
-            prev_day_date=prev_day_date,
+            prev_day_candles=None,
+            prev_day_date=None,
         )
+        if int(seed_prev_day) == 1:
+            # Seed previous-day candles asynchronously so /api/live/start responds immediately.
+            global LIVE_SEED_THREAD, LIVE_SEED_STATUS
+            LIVE_SEED_STATUS = {"status": "queued"}
+
+            def _seed() -> None:
+                global LIVE_SEED_STATUS
+                LIVE_SEED_STATUS = {"status": "running"}
+                try:
+                    out = _fetch_prev_trading_day_candles(security_id=sec, access_token=access_token)
+                    if out is None:
+                        LIVE_SEED_STATUS = {"status": "done", "result": None}
+                        return
+                    prev_day_date, prev_day_candles = out
+                    with LIVE_LOCK:
+                        eng = LIVE_ENGINE
+                    if eng is not None:
+                        try:
+                            eng.set_prev_day_candles(prev_day_candles)
+                        except Exception:
+                            pass
+                    LIVE_SEED_STATUS = {"status": "done", "result": {"prev_day_date": prev_day_date, "candles": len(prev_day_candles)}}
+                except Exception as e:
+                    LIVE_SEED_STATUS = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+            LIVE_SEED_THREAD = threading.Thread(target=_seed, daemon=True, name="live_seed_prev_day")
+            LIVE_SEED_THREAD.start()
     # Give the background thread a moment to connect; helps surface immediate failures.
     time.sleep(0.25)
     alive = LIVE_THREAD is not None and LIVE_THREAD.is_alive()
@@ -1363,7 +1423,7 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
             "ok": True,
             "symbol": symbol.upper().strip(),
             "security_id": sec,
-            "seed": seed_info,
+            "seed": LIVE_SEED_STATUS,
             "thread_alive": alive,
             "last_error": LIVE_LAST_ERROR,
         }
@@ -1401,6 +1461,9 @@ def live_stop() -> JSONResponse:
         LIVE_OI_SNAPSHOT = None
         LIVE_OI_UPDATED_AT = None
         LIVE_OI_LAST_ERROR = None
+        global LIVE_SEED_THREAD, LIVE_SEED_STATUS
+        LIVE_SEED_THREAD = None
+        LIVE_SEED_STATUS = None
     except Exception:
         pass
     try:
@@ -1416,6 +1479,9 @@ def live_stop() -> JSONResponse:
 
 @app.get("/api/live/status")
 def live_status() -> JSONResponse:
+    settings = get_settings()
+    dhan_ok = bool(_get_dhan_client_id_raw(settings.db_path) and _get_dhan_access_token_raw(settings.db_path))
+    gem_ok = bool(_get_gemini_api_key_raw(settings.db_path))
     running = LIVE_THREAD is not None and LIVE_THREAD.is_alive() and LIVE_ENGINE is not None and not LIVE_STOP.is_set()
     if not running or LIVE_ENGINE is None:
         with LIVE_ERRORS_LOCK:
@@ -1433,6 +1499,8 @@ def live_status() -> JSONResponse:
                 "last_tick_at": LIVE_LAST_TICK_AT,
                 "last_tick_ltp": LIVE_LAST_TICK_LTP,
                 "feed_config": LIVE_FEED_CONFIG,
+                "seed": LIVE_SEED_STATUS,
+                "configured": {"dhan": dhan_ok, "gemini": gem_ok},
             }
         )
     st = LIVE_ENGINE.status()
@@ -1454,6 +1522,8 @@ def live_status() -> JSONResponse:
             "last_tick_at": LIVE_LAST_TICK_AT,
             "last_tick_ltp": LIVE_LAST_TICK_LTP,
             "feed_config": LIVE_FEED_CONFIG,
+            "seed": LIVE_SEED_STATUS,
+            "configured": {"dhan": dhan_ok, "gemini": gem_ok},
         }
     )
 
