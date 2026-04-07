@@ -60,6 +60,25 @@ def _sanitize_error(s: str) -> str:
     return s
 
 
+def _gemini_feedback(data: dict) -> dict:
+    """
+    Extract useful debugging signals from Gemini responses (safety blocks, finish reason).
+    """
+    try:
+        pf = data.get("promptFeedback") or {}
+        cands = data.get("candidates") or []
+        cand0 = (cands[0] if cands else {}) or {}
+        return {
+            "candidates_count": int(len(cands)),
+            "prompt_block_reason": pf.get("blockReason"),
+            "prompt_safety_ratings": pf.get("safetyRatings"),
+            "finish_reason": cand0.get("finishReason"),
+            "candidate_safety_ratings": cand0.get("safetyRatings"),
+        }
+    except Exception:
+        return {}
+
+
 def _normalize_model_id(model: str) -> str:
     """
     Accept both forms:
@@ -129,10 +148,18 @@ class GeminiDecider:
         # Prefer Gemini structured output when available; fallback to prompt-only JSON.
         body = {
             "systemInstruction": {"parts": [{"text": sys}]},
+            # Make safety deterministic and less likely to return empty candidates.
+            # Default for Gemini 2.5/3 is OFF, but we still set explicitly to reduce surprises.
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+            ],
             "contents": [{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 180,
+                "maxOutputTokens": 256,
                 "responseMimeType": "application/json",
                 # Use JSON Schema via GenerationConfig.responseJsonSchema (Gemini structured outputs).
                 # responseSchema is a different (OpenAPI-subset) schema type; mixing formats causes 400s and disables
@@ -143,17 +170,18 @@ class GeminiDecider:
 
         # Normalize model id to avoid "/models/models/..." 404s when users copy from ListModels.
         url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
-        params = {"key": self.api_key}
+        # Prefer header auth (keeps keys out of URLs/logs).
+        headers = {"x-goog-api-key": self.api_key}
         data: dict | None = None
         last_err: str | None = None
         with httpx.Client(timeout=self.timeout_s) as client:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
-                    r = client.post(url, params=params, json=body)
+                    r = client.post(url, headers=headers, json=body)
                     if r.status_code >= 400 and "responseJsonSchema" in body["generationConfig"]:
                         # Retry without schema if the endpoint does not support it.
                         body["generationConfig"].pop("responseJsonSchema", None)
-                        r = client.post(url, params=params, json=body)
+                        r = client.post(url, headers=headers, json=body)
                     try:
                         r.raise_for_status()
                     except httpx.HTTPStatusError as e:
@@ -166,7 +194,8 @@ class GeminiDecider:
                     data = r.json()
                     # Treat empty candidate text as transient: retry (it happens occasionally with JSON mode).
                     if not _extract_candidate_text(data):
-                        raise ValueError("empty_candidate_text")
+                        fb = _gemini_feedback(data)
+                        raise ValueError(f"empty_candidate_text: {json.dumps(fb, ensure_ascii=False)}")
                     last_err = None
                     break
                 except httpx.HTTPStatusError as e:
@@ -181,7 +210,7 @@ class GeminiDecider:
                         continue
                 except ValueError as e:
                     last_err = _sanitize_error(str(e))
-                    if str(e) == "empty_candidate_text" and attempt < int(self.max_retries):
+                    if str(e).startswith("empty_candidate_text") and attempt < int(self.max_retries):
                         time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
                         continue
                     break
@@ -213,7 +242,7 @@ class GeminiDecider:
                     },
                 }
                 with httpx.Client(timeout=self.timeout_s) as client:
-                    r2 = client.post(url, params=params, json=body2)
+                    r2 = client.post(url, headers=headers, json=body2)
                     r2.raise_for_status()
                     data2 = r2.json()
                 text2 = _extract_candidate_text(data2)

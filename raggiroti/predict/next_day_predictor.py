@@ -118,6 +118,22 @@ def _sanitize_error(s: str) -> str:
     s = re.sub(r"(key=)[^&\s]+", r"\1***", s)
     return s
 
+
+def _gemini_feedback(data: dict) -> dict:
+    try:
+        pf = data.get("promptFeedback") or {}
+        cands = data.get("candidates") or []
+        cand0 = (cands[0] if cands else {}) or {}
+        return {
+            "candidates_count": int(len(cands)),
+            "prompt_block_reason": pf.get("blockReason"),
+            "prompt_safety_ratings": pf.get("safetyRatings"),
+            "finish_reason": cand0.get("finishReason"),
+            "candidate_safety_ratings": cand0.get("safetyRatings"),
+        }
+    except Exception:
+        return {}
+
 def _truncate(s: str, n: int = 240) -> str:
     s = (s or "").strip()
     if len(s) <= n:
@@ -435,10 +451,16 @@ class NextDayPredictor:
 
         body = {
             "systemInstruction": {"parts": [{"text": sys}]},
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+            ],
             "contents": [{"role": "user", "parts": [{"text": json.dumps(prompt_payload, ensure_ascii=False)}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 1400,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
                 # Use JSON Schema structured outputs for reliable JSON.
                 "responseJsonSchema": schema,
@@ -446,7 +468,7 @@ class NextDayPredictor:
         }
 
         url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
-        params = {"key": self.api_key}
+        headers = {"x-goog-api-key": self.api_key}
         def _fallback_prediction(err: str) -> dict:
             pc = float(prev_levels.close)
             pdh = float(prev_levels.high)
@@ -534,12 +556,12 @@ class NextDayPredictor:
             schema_dropped = False
             with httpx.Client(timeout=self.timeout_s) as client:
                 for attempt in range(1, int(self.max_retries) + 1):
-                    r = client.post(url, params=params, json=body)
+                    r = client.post(url, headers=headers, json=body)
                     if r.status_code >= 400 and "responseJsonSchema" in body["generationConfig"]:
                         # Older deployments may not support schemas. Drop and retry.
                         body["generationConfig"].pop("responseJsonSchema", None)
                         schema_dropped = True
-                        r = client.post(url, params=params, json=body)
+                        r = client.post(url, headers=headers, json=body)
                     try:
                         r.raise_for_status()
                     except httpx.HTTPStatusError as e:
@@ -554,7 +576,8 @@ class NextDayPredictor:
                         if attempt < int(self.max_retries):
                             time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
                             continue
-                        raise ValueError("empty_candidate_text")
+                        fb = _gemini_feedback(data)
+                        raise ValueError(f"empty_candidate_text: {json.dumps(fb, ensure_ascii=False)}")
                     try:
                         out = _extract_json(text)
                         break
@@ -581,7 +604,7 @@ class NextDayPredictor:
                     },
                 }
                 with httpx.Client(timeout=self.timeout_s) as client:
-                    r2 = client.post(url, params=params, json=body2)
+                    r2 = client.post(url, headers=headers, json=body2)
                     r2.raise_for_status()
                     data2 = r2.json()
                 text2 = _extract_candidate_text(data2)

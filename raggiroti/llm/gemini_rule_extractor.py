@@ -54,6 +54,22 @@ def _sanitize_error(s: str) -> str:
     return s
 
 
+def _gemini_feedback(data: dict) -> dict:
+    try:
+        pf = data.get("promptFeedback") or {}
+        cands = data.get("candidates") or []
+        cand0 = (cands[0] if cands else {}) or {}
+        return {
+            "candidates_count": int(len(cands)),
+            "prompt_block_reason": pf.get("blockReason"),
+            "prompt_safety_ratings": pf.get("safetyRatings"),
+            "finish_reason": cand0.get("finishReason"),
+            "candidate_safety_ratings": cand0.get("safetyRatings"),
+        }
+    except Exception:
+        return {}
+
+
 @dataclass(frozen=True)
 class GeminiRuleExtractor:
     api_key: str
@@ -117,6 +133,12 @@ class GeminiRuleExtractor:
 
         body = {
             "systemInstruction": {"parts": [{"text": sys}]},
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+            ],
             "contents": [{"role": "user", "parts": [{"text": transcript_text}]}],
             "generationConfig": {
                 "temperature": 0,
@@ -128,22 +150,23 @@ class GeminiRuleExtractor:
         }
 
         url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
-        params = {"key": self.api_key}
+        headers = {"x-goog-api-key": self.api_key}
 
         data: dict | None = None
         last_err: str | None = None
         with httpx.Client(timeout=self.timeout_s) as client:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
-                    r = client.post(url, params=params, json=body)
+                    r = client.post(url, headers=headers, json=body)
                     if r.status_code >= 400 and "responseJsonSchema" in body["generationConfig"]:
                         # Older deployments may not support schemas; retry without it.
                         body["generationConfig"].pop("responseJsonSchema", None)
-                        r = client.post(url, params=params, json=body)
+                        r = client.post(url, headers=headers, json=body)
                     r.raise_for_status()
                     data = r.json()
                     if not _extract_candidate_text(data):
-                        raise ValueError("empty_candidate_text")
+                        fb = _gemini_feedback(data)
+                        raise ValueError(f"empty_candidate_text: {json.dumps(fb, ensure_ascii=False)}")
                     last_err = None
                     break
                 except httpx.HTTPStatusError as e:
