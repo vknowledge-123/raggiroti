@@ -78,14 +78,37 @@ PREDICT_JOBS: dict[str, PredictJob] = {}
 LIVE_LOCK = threading.Lock()
 LIVE_THREAD: threading.Thread | None = None
 LIVE_OI_THREAD: threading.Thread | None = None
+LIVE_FEED: DhanLiveFeed | None = None
 LIVE_STOP = threading.Event()
 LIVE_ENGINE: LiveSimEngine | None = None
 LIVE_CANDLE_BUILDER: CandleBuilder1m | None = None
 LIVE_LOOP: asyncio.AbstractEventLoop | None = None
 LIVE_OI_SNAPSHOT: dict | None = None
 LIVE_LAST_ERROR: str | None = None
+LIVE_ERRORS_LOCK = threading.Lock()
+LIVE_ERRORS: list[dict] = []
+LIVE_ERRORS_MAX = 200
 
 SIM_ENGINE: LiveSimEngine | None = None
+
+
+def _push_live_error(kind: str, detail: object) -> None:
+    """
+    Keep a small in-memory ring buffer of live simulation errors for the dashboard/API.
+    This is separate from candle decisions where Gemini errors are already stored per-candle.
+    """
+    try:
+        item = {
+            "dt": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "kind": str(kind),
+            "detail": detail,
+        }
+        with LIVE_ERRORS_LOCK:
+            LIVE_ERRORS.append(item)
+            if len(LIVE_ERRORS) > int(LIVE_ERRORS_MAX):
+                LIVE_ERRORS[:] = LIVE_ERRORS[-int(LIVE_ERRORS_MAX) :]
+    except Exception:
+        pass
 
 
 def _ensure_gemini_table(conn: sqlite3.Connection) -> None:
@@ -1054,12 +1077,16 @@ def _start_live_thread(
     prev_day_candles: list | None,
     prev_day_date: str | None,
 ) -> None:
-    global LIVE_THREAD, LIVE_OI_THREAD, LIVE_ENGINE, LIVE_CANDLE_BUILDER
+    global LIVE_THREAD, LIVE_OI_THREAD, LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_FEED
     assert LIVE_LOOP is not None, "server loop not ready"
 
     LIVE_STOP.clear()
     global LIVE_LAST_ERROR
     LIVE_LAST_ERROR = None
+    with LIVE_ERRORS_LOCK:
+        LIVE_ERRORS.clear()
+    with LIVE_LOCK:
+        LIVE_FEED = None
     LIVE_ENGINE = LiveSimEngine(symbol=symbol, security_id=security_id, gemini_api_key=gemini_key, gemini_model=gemini_model, qty=qty)
     if prev_day_candles:
         try:
@@ -1069,6 +1096,7 @@ def _start_live_thread(
     LIVE_CANDLE_BUILDER = CandleBuilder1m()
 
     def _run() -> None:
+        global LIVE_FEED, LIVE_THREAD
         # DhanHQ marketfeed uses asyncio internally. In Python 3.11, non-main threads do not
         # have a default event loop, so we must create one explicitly.
         try:
@@ -1106,6 +1134,8 @@ def _start_live_thread(
                 access_token=access_token,
                 instruments=[LiveFeedInstrument(exchange_segment=int(exch), security_id=security_id, subscription_type=int(sub_type))],
             )
+            with LIVE_LOCK:
+                LIVE_FEED = feed
 
             def on_tick(msg: dict) -> None:
                 if LIVE_STOP.is_set():
@@ -1113,6 +1143,10 @@ def _start_live_thread(
                 try:
                     sec, ltp, vol, dt = parse_marketfeed_tick(msg)
                 except Exception:
+                    try:
+                        _push_live_error("tick_parse_error", {"keys": list((msg or {}).keys())[:12]})
+                    except Exception:
+                        _push_live_error("tick_parse_error", "parse_marketfeed_tick_failed")
                     return
                 if sec and sec != security_id:
                     return
@@ -1137,12 +1171,17 @@ def _start_live_thread(
             try:
                 global LIVE_LAST_ERROR
                 LIVE_LAST_ERROR = f"{type(e).__name__}: {e}"
+                _push_live_error("live_thread_error", LIVE_LAST_ERROR)
             except Exception:
                 pass
             return
         finally:
             if feed is not None:
                 feed.disconnect()
+            with LIVE_LOCK:
+                LIVE_FEED = None
+                # Mark thread slot free for next /api/live/start.
+                LIVE_THREAD = None
 
     LIVE_THREAD = threading.Thread(target=_run, daemon=True, name="dhan_live_feed")
     LIVE_THREAD.start()
@@ -1211,6 +1250,24 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
         except Exception as e:
             seed_info = {"error": str(e)}
 
+    # If a previous run is still stopping, attempt a best-effort disconnect+join so restart works.
+    t0: threading.Thread | None = None
+    feed0: DhanLiveFeed | None = None
+    with LIVE_LOCK:
+        if LIVE_THREAD is not None and LIVE_THREAD.is_alive() and (LIVE_STOP.is_set() or LIVE_ENGINE is None):
+            t0 = LIVE_THREAD
+            feed0 = LIVE_FEED
+    if t0 is not None:
+        try:
+            if feed0 is not None:
+                feed0.disconnect()
+        except Exception:
+            pass
+        try:
+            t0.join(timeout=1.2)
+        except Exception:
+            pass
+
     with LIVE_LOCK:
         if LIVE_THREAD is not None and LIVE_THREAD.is_alive():
             return JSONResponse({"ok": False, "error": "live already running"}, status_code=400)
@@ -1244,12 +1301,32 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
 
 @app.post("/api/live/stop")
 def live_stop() -> JSONResponse:
-    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR
+    global LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_LAST_ERROR, LIVE_FEED, LIVE_THREAD
     LIVE_STOP.set()
+    # Best-effort: disconnect websocket to unblock run_forever() so the thread can exit quickly.
+    t0: threading.Thread | None = None
+    try:
+        with LIVE_LOCK:
+            if LIVE_FEED is not None:
+                LIVE_FEED.disconnect()
+            t0 = LIVE_THREAD
+    except Exception:
+        pass
     with LIVE_LOCK:
         LIVE_ENGINE = None
         LIVE_CANDLE_BUILDER = None
         LIVE_LAST_ERROR = None
+        LIVE_FEED = None
+    with LIVE_ERRORS_LOCK:
+        LIVE_ERRORS.clear()
+    try:
+        if t0 is not None and t0.is_alive():
+            t0.join(timeout=1.2)
+    except Exception:
+        pass
+    with LIVE_LOCK:
+        if LIVE_THREAD is not None and not LIVE_THREAD.is_alive():
+            LIVE_THREAD = None
     return JSONResponse({"ok": True})
 
 
@@ -1257,9 +1334,44 @@ def live_stop() -> JSONResponse:
 def live_status() -> JSONResponse:
     running = LIVE_THREAD is not None and LIVE_THREAD.is_alive() and LIVE_ENGINE is not None and not LIVE_STOP.is_set()
     if not running or LIVE_ENGINE is None:
-        return JSONResponse({"ok": True, "running": False, "last_error": LIVE_LAST_ERROR})
+        with LIVE_ERRORS_LOCK:
+            err_count = int(len(LIVE_ERRORS))
+        return JSONResponse(
+            {
+                "ok": True,
+                "running": False,
+                "last_error": LIVE_LAST_ERROR,
+                "error_count": err_count,
+                "thread_alive": bool(LIVE_THREAD is not None and LIVE_THREAD.is_alive()),
+                "stop_set": bool(LIVE_STOP.is_set()),
+                "engine_present": bool(LIVE_ENGINE is not None),
+            }
+        )
     st = LIVE_ENGINE.status()
-    return JSONResponse({"ok": True, "running": True, "status": asdict(st), "last_error": LIVE_LAST_ERROR})
+    with LIVE_ERRORS_LOCK:
+        last_errors = list(LIVE_ERRORS[-10:])
+        err_count = int(len(LIVE_ERRORS))
+    return JSONResponse(
+        {
+            "ok": True,
+            "running": True,
+            "status": asdict(st),
+            "last_error": LIVE_LAST_ERROR,
+            "error_count": err_count,
+            "last_errors": last_errors,
+            "thread_alive": bool(LIVE_THREAD is not None and LIVE_THREAD.is_alive()),
+            "stop_set": bool(LIVE_STOP.is_set()),
+            "engine_present": bool(LIVE_ENGINE is not None),
+        }
+    )
+
+
+@app.get("/api/live/errors")
+def live_errors(limit: int = 100) -> JSONResponse:
+    lim = max(1, min(int(limit), 500))
+    with LIVE_ERRORS_LOCK:
+        items = list(LIVE_ERRORS[-lim:])
+    return JSONResponse({"ok": True, "count": len(items), "errors": items})
 
 
 @app.get("/api/live/candles")
