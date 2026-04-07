@@ -135,12 +135,25 @@ def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
     """
     Accepts:
     - Our compact wall summary format: {"ok":true,"ce_walls":[...],"pe_walls":[...]}
+    - dhanhq wrapper responses: {"status":"success|failure","remarks":...,"data":<payload>}
     - Dhan option chain format (handled by summarize_oi_walls)
     - NSE option chain JSON (common keys: records.data[*].CE/PE)
     Returns our compact summary format.
     """
     if isinstance(payload, dict) and payload.get("ok") is True and isinstance(payload.get("ce_walls"), list) and isinstance(payload.get("pe_walls"), list):
         return payload
+
+    # dhanhq wrapper: unwrap recursively
+    try:
+        if isinstance(payload, dict) and payload.get("status") in {"success", "failure"} and "data" in payload:
+            inner = payload.get("data")
+            if isinstance(inner, dict):
+                return summarize_oi_walls_any(inner, top_n=top_n)
+            if isinstance(inner, list):
+                # Some wrappers may return the list directly.
+                return summarize_oi_walls({"data": inner}, top_n=top_n)
+    except Exception:
+        pass
 
     # NSE option chain API style: {"records":{"data":[{"strikePrice":...,"CE":{...},"PE":{...}}, ...]}}
     try:
@@ -150,6 +163,63 @@ def summarize_oi_walls_any(payload: dict, top_n: int = 5) -> dict:
             data = rec.get("data")
         if isinstance(data, list):
             return summarize_oi_walls({"data": data}, top_n=top_n)
+    except Exception:
+        pass
+
+    def _looks_like_strike_row(x: object) -> bool:
+        if not isinstance(x, dict):
+            return False
+        if x.get("strikePrice") is not None or x.get("strike_price") is not None or x.get("strike") is not None:
+            return True
+        # Some vendors nest strike under a key.
+        if isinstance(x.get("StrikePrice"), (int, float, str)):
+            return True
+        return False
+
+    def _looks_like_option_row(x: object) -> bool:
+        if not isinstance(x, dict):
+            return False
+        if not _looks_like_strike_row(x):
+            return False
+        # Common legs
+        if isinstance(x.get("CE"), dict) or isinstance(x.get("PE"), dict):
+            return True
+        if isinstance(x.get("ce"), dict) or isinstance(x.get("pe"), dict):
+            return True
+        if isinstance(x.get("call"), dict) or isinstance(x.get("put"), dict):
+            return True
+        return False
+
+    def _find_option_rows(obj: object, max_nodes: int = 2000) -> list[dict] | None:
+        """
+        Best-effort search for the strike-rows list inside deeply nested payloads.
+        Keeps traversal bounded to avoid scanning huge responses indefinitely.
+        """
+        seen = 0
+        stack = [obj]
+        while stack and seen < max_nodes:
+            cur = stack.pop()
+            seen += 1
+            if isinstance(cur, list):
+                # check a small prefix
+                sample = cur[:20]
+                if sample and any(_looks_like_option_row(x) for x in sample):
+                    # filter only dict rows
+                    return [x for x in cur if isinstance(x, dict)]
+                # else traverse elements (bounded)
+                for x in sample:
+                    stack.append(x)
+                continue
+            if isinstance(cur, dict):
+                for v in list(cur.values())[:60]:
+                    stack.append(v)
+        return None
+
+    # Dhan / other nested shapes: locate the strike rows list anywhere in the payload.
+    try:
+        rows = _find_option_rows(payload)
+        if isinstance(rows, list) and rows:
+            return summarize_oi_walls({"data": rows}, top_n=top_n)
     except Exception:
         pass
 

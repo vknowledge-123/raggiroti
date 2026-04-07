@@ -1323,27 +1323,33 @@ def _start_live_thread(
         global LIVE_OI_SNAPSHOT, LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
         try:
             oc = DhanOptionChainClient(client_id=client_id, access_token=access_token)
-            # For index: under_exchange_segment is typically IDX_I in REST APIs.
-            ex_seg = "IDX_I"
-            exp = oc.expiry_list(under_security_id=int(security_id), under_exchange_segment=ex_seg)
-            exp_list = _extract_list_any(exp, ["data", "Data", "expiryList", "expiry_list", "expiries", "expiry"])
-            if exp_list:
-                expiry = str(exp_list[0])
-            else:
-                # Include a small hint of the returned shape for debugging.
-                try:
-                    keys = list(exp.keys())[:20] if isinstance(exp, dict) else []
-                except Exception:
-                    keys = []
-                _push_live_error("oi_error", {"where": "expiry_list", "error": "empty_expiry_list", "raw_keys": keys})
-                LIVE_OI_LAST_ERROR = "empty_expiry_list"
-                return
-        except Exception:
-            _push_live_error("oi_error", {"where": "expiry_list", "error": "exception"})
-            LIVE_OI_LAST_ERROR = "expiry_list_exception"
+        except Exception as e:
+            LIVE_OI_LAST_ERROR = f"oi_init_failed:{type(e).__name__}"
+            _push_live_error("oi_error", {"where": "init", "error": LIVE_OI_LAST_ERROR})
             return
+
+        # For index: under_exchange_segment is typically IDX_I in REST APIs.
+        ex_seg = "IDX_I"
+        expiry: str | None = None
         while not LIVE_STOP.is_set():
             try:
+                # If expiry missing, keep retrying instead of stopping the OI thread forever.
+                if not expiry:
+                    exp = oc.expiry_list(under_security_id=int(security_id), under_exchange_segment=ex_seg)
+                    exp_list = _extract_list_any(exp, ["data", "Data", "expiryList", "expiry_list", "expiries", "expiry"])
+                    if exp_list:
+                        expiry = str(exp_list[0])
+                        LIVE_OI_LAST_ERROR = None
+                    else:
+                        try:
+                            keys = list(exp.keys())[:20] if isinstance(exp, dict) else []
+                        except Exception:
+                            keys = []
+                        LIVE_OI_LAST_ERROR = "empty_expiry_list"
+                        _push_live_error("oi_error", {"where": "expiry_list", "error": "empty_expiry_list", "raw_keys": keys})
+                        time.sleep(30)
+                        continue
+
                 chain = oc.option_chain(under_security_id=int(security_id), under_exchange_segment=ex_seg, expiry=expiry)
                 # Use the robust parser that supports dhanhq wrapper responses.
                 summary = summarize_oi_walls_any(chain, top_n=5)
@@ -1355,6 +1361,11 @@ def _start_live_thread(
                         LIVE_ENGINE.set_oi_snapshot(summary)
                 else:
                     LIVE_OI_LAST_ERROR = str(summary.get("error") or "oi_summary_failed")
+                    try:
+                        raw_keys = list(chain.keys())[:20] if isinstance(chain, dict) else []
+                    except Exception:
+                        raw_keys = []
+                    _push_live_error("oi_error", {"where": "option_chain_parse", "error": LIVE_OI_LAST_ERROR, "raw_keys": raw_keys})
             except Exception:
                 try:
                     LIVE_OI_LAST_ERROR = "oi_option_chain_exception"
