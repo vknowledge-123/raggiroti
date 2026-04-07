@@ -16,6 +16,8 @@ class PerCandleRAGPolicy(Policy):
     Use only for small ranges or debugging.
     """
 
+    last_raw: dict | None = None
+
     def decide(self, state: dict) -> Decision:
         settings = get_settings()
         api_key = settings.llm_api_key or settings.openai_api_key
@@ -40,6 +42,21 @@ class PerCandleRAGPolicy(Policy):
             out = llm.decide(state=state, retrieved={"rulebook_version": retrieved.rulebook_version, "rules": retrieved.rules})
         except Exception as e:
             return Decision(action="WAIT", reason=f"llm_error: {e}")
+        try:
+            object.__setattr__(
+                self,
+                "last_raw",
+                {
+                    "provider": "openai_compatible",
+                    "model": settings.openai_rule_extract_model,
+                    "rulebook_version": retrieved.rulebook_version,
+                    "retrieved_count": len(retrieved.rules),
+                    "retrieved_rule_ids": [str(r.get("id")) for r in (retrieved.rules or []) if r.get("id")][:30],
+                    "out": out,
+                },
+            )
+        except Exception:
+            pass
         return Decision(
             action=out["action"],
             sl_points=float(out["sl_points"]),

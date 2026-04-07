@@ -47,7 +47,13 @@ def main() -> int:
         date = dates[i]
         prev_levels = compute_prev_day_levels(by_date[prev_date])
         day = sorted(by_date[date], key=lambda c: c.dt)
-        scenario = classify_open_scenario(day[0].open, prev_levels.close, gap_threshold_points=args.gap, flat_threshold_points=args.flat)
+        scenario = classify_open_scenario(
+            day[0].open,
+            prev_levels.close,
+            gap_up_threshold_points=args.gap,
+            gap_down_threshold_points=args.gap,
+            flat_threshold_points=args.flat,
+        )
         policy = ScenarioPolicy(prev=prev_levels, scenario=scenario)
         res = run_backtest(day, policy=policy, qty=args.qty, prev=prev_levels)
         print(f"{date} scenario={scenario} pnl(points*qty)={res.realized_pnl_points:.2f}")

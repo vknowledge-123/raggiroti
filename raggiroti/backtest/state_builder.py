@@ -56,19 +56,23 @@ class StateBuilder:
     _operator_exit_risk: bool = False
     _retail_participation_present: bool = True
     _overcrowding_risk: bool = False
-    _gap_threshold_points: float = 30.0
+    _gap_up_threshold_points: float = 30.0
+    _gap_down_threshold_points: float = 30.0
     _flat_threshold_points: float = 15.0
     _prev_confirmed_long: bool = False
     _prev_confirmed_short: bool = False
+    _daily_plan: dict | None = None
 
     def on_new_day(
         self,
         prev: PrevDayLevels | None = None,
-        gap_threshold_points: float = 30.0,
+        gap_up_threshold_points: float = 30.0,
+        gap_down_threshold_points: float = 30.0,
         flat_threshold_points: float = 15.0,
     ) -> None:
         self.prev = prev
-        self._gap_threshold_points = float(gap_threshold_points)
+        self._gap_up_threshold_points = float(gap_up_threshold_points)
+        self._gap_down_threshold_points = float(gap_down_threshold_points)
         self._flat_threshold_points = float(flat_threshold_points)
         self.pdh = None
         self.pdl = None
@@ -99,6 +103,54 @@ class StateBuilder:
         self._overcrowding_risk = False
         self._prev_confirmed_long = False
         self._prev_confirmed_short = False
+        self._daily_plan = None
+
+    def _build_daily_plan(self) -> dict | None:
+        if self.prev is None or self.day_open is None or self.scenario is None:
+            return None
+        gap_points = float(self.day_open - self.prev.close)
+
+        # Default: one-sided bias from opening scenario.
+        bias = "WAIT"
+        if self.scenario in ("gap_up", "mild_gap_up"):
+            bias = "SELL"
+        elif self.scenario in ("gap_down", "mild_gap_down"):
+            bias = "BUY"
+        elif self.scenario == "flat":
+            bias = "WAIT"
+
+        # Zones anchored to previous-day range (used for "sensitive areas" / no-trade).
+        zone_low = float(self.prev.low + 0.25 * (self.prev.high - self.prev.low))
+        zone_high = float(self.prev.low + 0.75 * (self.prev.high - self.prev.low))
+
+        return {
+            "scenario": self.scenario,
+            "gap_points": gap_points,
+            "bias": bias,  # BUY | SELL | WAIT (one-sided plan)
+            "levels": {
+                "prev_close": float(self.prev.close),
+                "PDH": float(self.prev.high),
+                "PDL": float(self.prev.low),
+                "prev_last_hour_high": float(self.prev.last_hour_high),
+                "prev_last_hour_low": float(self.prev.last_hour_low),
+            },
+            "zones": {
+                "discount_below": float(self.prev.low + 0.25 * (self.prev.high - self.prev.low)),
+                "fair": [zone_low, zone_high],
+                "inflated_above": float(self.prev.low + 0.75 * (self.prev.high - self.prev.low)),
+            },
+            "triggers": {
+                # Liquidity sweeps that should be hunted (sweep + reclaim = trap confirmation).
+                "short_sweep_level": float(self.prev.high),
+                "long_sweep_level": float(self.prev.low),
+            },
+            # Guardrails: keep quality high.
+            "guardrails": {
+                "max_entries_per_day": 2,
+                "cooldown_after_sl_candles": 10,
+                "lock_direction_after_first_entry": True,
+            },
+        }
 
     def _update_swings(self) -> None:
         if self._buf is None or self._swing_highs is None or self._swing_lows is None:
@@ -187,11 +239,13 @@ class StateBuilder:
                 self.scenario = classify_open_scenario(
                     self.day_open,
                     self.prev.close,
-                    gap_threshold_points=self._gap_threshold_points,
+                    gap_up_threshold_points=self._gap_up_threshold_points,
+                    gap_down_threshold_points=self._gap_down_threshold_points,
                     flat_threshold_points=self._flat_threshold_points,
                 )
                 self._gap_type = "gap_up" if self.day_open > self.prev.close else ("gap_down" if self.day_open < self.prev.close else "flat")
                 self._prev_close_seen = self.prev.close
+                self._daily_plan = self._build_daily_plan()
 
         if self._first_candle_color is None:
             self._first_candle_color = "green" if candle.close >= candle.open else "red"
@@ -240,6 +294,19 @@ class StateBuilder:
         event_confirmed_short = confirmed_short and not self._prev_confirmed_short
         self._prev_confirmed_long = confirmed_long
         self._prev_confirmed_short = confirmed_short
+
+        # Day-plan adaptation (one-sided): if the planned bias is invalidated, switch to WAIT (do not flip sides).
+        if isinstance(self._daily_plan, dict):
+            try:
+                bias = str(self._daily_plan.get("bias") or "WAIT").upper()
+                if bias == "SELL" and event_confirmed_long:
+                    self._daily_plan["bias"] = "WAIT"
+                    self._daily_plan["note"] = "bias_invalidated_by_confirmed_long"
+                if bias == "BUY" and event_confirmed_short:
+                    self._daily_plan["bias"] = "WAIT"
+                    self._daily_plan["note"] = "bias_invalidated_by_confirmed_short"
+            except Exception:
+                pass
 
         # --------- High-impact sensors (1m, single-instrument) ---------
         # These are proxy-based; improve thresholds as you calibrate on BankNifty.
@@ -329,6 +396,7 @@ class StateBuilder:
             "confirmed_short": confirmed_short,
             "event_confirmed_long": event_confirmed_long,
             "event_confirmed_short": event_confirmed_short,
+            "daily_plan": self._daily_plan,
         }
 
     def _classify_market_type(self) -> str:

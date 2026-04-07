@@ -54,15 +54,15 @@ def compute_prev_day_levels(
 def classify_open_scenario(
     day_open: float,
     prev_close: float,
-    gap_threshold_points: float = 30.0,
+    gap_up_threshold_points: float = 30.0,
+    gap_down_threshold_points: float = 30.0,
     flat_threshold_points: float = 15.0,
 ) -> str:
     gap = day_open - prev_close
-    if gap >= gap_threshold_points:
+    if gap >= gap_up_threshold_points:
         return "gap_up"
-    if gap <= -gap_threshold_points:
+    if gap <= -gap_down_threshold_points:
         return "gap_down"
     if abs(gap) <= flat_threshold_points:
         return "flat"
     return "mild_gap_up" if gap > 0 else "mild_gap_down"
-

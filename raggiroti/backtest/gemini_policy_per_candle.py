@@ -33,7 +33,14 @@ class PerCandleGeminiPolicy(Policy):
         retrieved = retrieve_rulebook_rules(self.rulebook_path, state, limit=int(self.retrieve_limit))
         decider = GeminiDecider(api_key=self.api_key, model=self.model, db_path=self.db_path)
         out = decider.decide(state=state, retrieved={"rulebook_version": retrieved.rulebook_version, "rules": retrieved.rules})
-        self.last_raw = out
+        self.last_raw = {
+            "provider": "gemini",
+            "model": self.model,
+            "rulebook_version": retrieved.rulebook_version,
+            "retrieved_count": len(retrieved.rules),
+            "retrieved_rule_ids": [str(r.get("id")) for r in (retrieved.rules or []) if r.get("id")][:30],
+            "out": out,
+        }
 
         action = str(out.get("action") or "WAIT").upper().strip()
         if action not in {"BUY", "SELL", "WAIT", "EXIT"}:
@@ -49,16 +56,56 @@ class PerCandleGeminiPolicy(Policy):
 
         sl_abs = out.get("sl")
         targets = out.get("targets") or []
+
+        # Fallbacks (rulebook-aligned): if Gemini omits SL/targets, use liquidity pools.
+        if sl_abs is None:
+            if action == "BUY":
+                lvl = None
+                if isinstance(state.get("last_swing_low_1m"), dict):
+                    lvl = state["last_swing_low_1m"].get("price")
+                if lvl is None:
+                    lvl = state.get("prev_pdl")
+                if lvl is not None:
+                    sl_abs = float(lvl) - 5.0
+                else:
+                    sl_abs = entry - 15.0
+            else:
+                lvl = None
+                if isinstance(state.get("last_swing_high_1m"), dict):
+                    lvl = state["last_swing_high_1m"].get("price")
+                if lvl is None:
+                    lvl = state.get("prev_pdh")
+                if lvl is not None:
+                    sl_abs = float(lvl) + 5.0
+                else:
+                    sl_abs = entry + 15.0
+
+        if not targets:
+            if action == "BUY":
+                t = None
+                if isinstance(state.get("last_swing_high_1m"), dict):
+                    t = state["last_swing_high_1m"].get("price")
+                if t is None:
+                    t = state.get("prev_pdh") or state.get("prev_close")
+                if t is not None:
+                    targets = [float(t)]
+            else:
+                t = None
+                if isinstance(state.get("last_swing_low_1m"), dict):
+                    t = state["last_swing_low_1m"].get("price")
+                if t is None:
+                    t = state.get("prev_pdl") or state.get("prev_close")
+                if t is not None:
+                    targets = [float(t)]
         t1_abs = None if not targets else targets[0]
 
         # Convert absolute to points
         sl_points = 15.0
-        if sl_abs is not None:
-            try:
-                slp = float(sl_abs)
-                sl_points = max(0.1, (entry - slp) if action == "BUY" else (slp - entry))
-            except Exception:
-                sl_points = 15.0
+        try:
+            slp = float(sl_abs)
+            sl_points = max(0.1, (entry - slp) if action == "BUY" else (slp - entry))
+        except Exception:
+            sl_points = 15.0
 
         target_points = None
         if t1_abs is not None:
@@ -69,4 +116,3 @@ class PerCandleGeminiPolicy(Policy):
                 target_points = None
 
         return Decision(action=action, sl_points=float(sl_points), target_points=target_points, reason="gemini")
-

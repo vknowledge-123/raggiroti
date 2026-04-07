@@ -260,13 +260,17 @@ def _compute_backtest_range_dhan(
     end_date: str,
     interval: str,
     qty: int,
-    gap: float,
+    gap_up: float,
+    gap_down: float,
     flat: float,
     policy: str,
     include_fills: int,
     max_fills: int,
     include_decisions: int = 0,
     max_decisions: int = 300,
+    max_entries_per_day: int | None = None,
+    cooldown_after_sl_candles: int = 0,
+    lock_direction_after_first_entry: int = 0,
 ) -> dict:
     t0 = datetime.now(timezone.utc)
     settings = get_settings()
@@ -341,7 +345,8 @@ def _compute_backtest_range_dhan(
         scenario = classify_open_scenario(
             day_candles[0].open,
             prev_levels.close,
-            gap_threshold_points=gap,
+            gap_up_threshold_points=gap_up,
+            gap_down_threshold_points=gap_down,
             flat_threshold_points=flat,
         )
 
@@ -370,10 +375,14 @@ def _compute_backtest_range_dhan(
             policy=pol,
             qty=qty,
             prev=prev_levels,
-            gap_threshold_points=gap,
+            gap_up_threshold_points=gap_up,
+            gap_down_threshold_points=gap_down,
             flat_threshold_points=flat,
             include_decisions=bool(int(include_decisions)) or (policy in {"gemini_all", "rag_all"}),
             max_decisions=int(max(50, int(max_decisions))),
+            max_entries_per_day=None if max_entries_per_day is None else int(max_entries_per_day),
+            cooldown_after_sl_candles=int(cooldown_after_sl_candles),
+            lock_direction_after_first_entry=bool(int(lock_direction_after_first_entry)),
         )
         total += res.realized_pnl_points
         item = {"date": date, "prev_date": prev_date, "scenario": scenario, "pnl_points_x_qty": res.realized_pnl_points}
@@ -576,13 +585,21 @@ def home() -> str:
         <input name="interval" value="1" />
         <label>Quantity</label>
         <input name="qty" type="number" value="65" />
-        <label>Gap threshold points</label>
-        <input name="gap" type="number" value="30" />
+        <label>Gap up threshold points</label>
+        <input name="gap_up" type="number" value="30" />
+        <label>Gap down threshold points</label>
+        <input name="gap_down" type="number" value="30" />
         <label>Flat threshold points</label>
         <input name="flat" type="number" value="15" />
         <label>Policy (rulebook | rag | rag_all | gemini_all | scenario)</label>
         <input name="policy" value="rulebook" />
         <p class="muted">Use <code>gemini_all</code> for simulation-like per-candle Gemini decisions (slow/expensive).</p>
+        <label>Max entries per day (quality filter)</label>
+        <input name="max_entries_per_day" type="number" value="2" />
+        <label>Cooldown after SL (candles)</label>
+        <input name="cooldown_after_sl_candles" type="number" value="10" />
+        <label>Lock direction after first entry (0/1)</label>
+        <input name="lock_direction_after_first_entry" value="1" />
         <label>Include fills (0/1)</label>
         <input name="include_fills" value="0" />
         <label>Max fills per day</label>
@@ -1469,14 +1486,24 @@ async def backtest_range_dhan(
     end_date: str = Form(...),
     interval: str = Form("1"),
     qty: int = Form(65),
-    gap: float = Form(30.0),
+    gap: float | None = Form(None),  # backward-compat (single threshold)
+    gap_up: float | None = Form(None),
+    gap_down: float | None = Form(None),
     flat: float = Form(15.0),
     policy: str = Form("rulebook"),  # rulebook | rag | rag_all | scenario
     include_fills: int = Form(0),
     max_fills: int = Form(200),
     include_decisions: int = Form(0),
     max_decisions: int = Form(300),
+    max_entries_per_day: int | None = Form(None),
+    cooldown_after_sl_candles: int = Form(0),
+    lock_direction_after_first_entry: int = Form(0),
 ) -> JSONResponse:
+    # Resolve thresholds (support old "gap" field).
+    if gap_up is None:
+        gap_up = 30.0 if gap is None else float(gap)
+    if gap_down is None:
+        gap_down = 30.0 if gap is None else float(gap)
     # Direct (non-job) execution endpoint. Prefer /submit + /job for long runs.
     fn = partial(
         _compute_backtest_range_dhan,
@@ -1487,13 +1514,17 @@ async def backtest_range_dhan(
         end_date=end_date,
         interval=interval,
         qty=qty,
-        gap=gap,
+        gap_up=float(gap_up),
+        gap_down=float(gap_down),
         flat=flat,
         policy=policy,
         include_fills=include_fills,
         max_fills=max_fills,
         include_decisions=include_decisions,
         max_decisions=max_decisions,
+        max_entries_per_day=None if max_entries_per_day is None else int(max_entries_per_day),
+        cooldown_after_sl_candles=int(cooldown_after_sl_candles),
+        lock_direction_after_first_entry=int(lock_direction_after_first_entry),
     )
     result = await anyio.to_thread.run_sync(fn)
     status = 200 if result.get("ok") else 400
@@ -1509,14 +1540,23 @@ async def backtest_range_dhan_submit(
     end_date: str = Form(...),
     interval: str = Form("1"),
     qty: int = Form(65),
-    gap: float = Form(30.0),
+    gap: float | None = Form(None),
+    gap_up: float | None = Form(None),
+    gap_down: float | None = Form(None),
     flat: float = Form(15.0),
     policy: str = Form("rulebook"),
     include_fills: int = Form(0),
     max_fills: int = Form(200),
     include_decisions: int = Form(0),
     max_decisions: int = Form(300),
+    max_entries_per_day: int | None = Form(None),
+    cooldown_after_sl_candles: int = Form(0),
+    lock_direction_after_first_entry: int = Form(0),
 ) -> JSONResponse:
+    if gap_up is None:
+        gap_up = 30.0 if gap is None else float(gap)
+    if gap_down is None:
+        gap_down = 30.0 if gap is None else float(gap)
     job_id = f"bt_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc).isoformat()
     job = BacktestJob(id=job_id, status="queued", created_at=now, updated_at=now)
@@ -1535,13 +1575,17 @@ async def backtest_range_dhan_submit(
                 end_date=end_date,
                 interval=interval,
                 qty=qty,
-                gap=gap,
+                gap_up=float(gap_up),
+                gap_down=float(gap_down),
                 flat=flat,
                 policy=policy,
                 include_fills=include_fills,
                 max_fills=max_fills,
                 include_decisions=include_decisions,
                 max_decisions=max_decisions,
+                max_entries_per_day=None if max_entries_per_day is None else int(max_entries_per_day),
+                cooldown_after_sl_candles=int(cooldown_after_sl_candles),
+                lock_direction_after_first_entry=int(lock_direction_after_first_entry),
             )
             result = await anyio.to_thread.run_sync(fn)
             job.result = result

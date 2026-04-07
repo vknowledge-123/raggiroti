@@ -30,6 +30,9 @@ class RAGPolicy(Policy):
     - LLM outputs structured decision, cached in SQLite for deterministic repeats.
     """
 
+    # Debug hook for engine logging (safe even in frozen dataclass via object.__setattr__).
+    last_raw: dict | None = None
+
     def decide(self, state: dict) -> Decision:
         deterministic = RulebookScoringPolicy().decide(state)
         # If a position is open, the engine only honors EXIT decisions.
@@ -65,6 +68,21 @@ class RAGPolicy(Policy):
         except Exception as e:
             # Never crash the backtest/web app due to LLM instability.
             return Decision(action="WAIT", reason=f"llm_error: {e}")
+        try:
+            object.__setattr__(
+                self,
+                "last_raw",
+                {
+                    "provider": "openai_compatible",
+                    "model": settings.openai_rule_extract_model,
+                    "rulebook_version": retrieved.rulebook_version,
+                    "retrieved_count": len(retrieved.rules),
+                    "retrieved_rule_ids": [str(r.get("id")) for r in (retrieved.rules or []) if r.get("id")][:30],
+                    "out": out,
+                },
+            )
+        except Exception:
+            pass
         return Decision(
             action=out["action"],
             sl_points=float(out["sl_points"]),
