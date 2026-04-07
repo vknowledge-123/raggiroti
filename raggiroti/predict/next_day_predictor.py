@@ -148,10 +148,10 @@ def _compact_rules(rules: list[dict], limit: int = 25) -> list[dict]:
             {
                 "id": r.get("id"),
                 "category": r.get("category"),
-                "name": _truncate(str(r.get("name") or ""), 120),
-                "condition": _truncate(str(r.get("condition") or ""), 260),
-                "action": _truncate(str(r.get("action") or ""), 260),
-                "tags": r.get("tags") or [],
+                # Keep this extremely compact; long rule text increases token usage and can push responses to MAX_TOKENS.
+                "name": _truncate(str(r.get("name") or ""), 80),
+                "condition": _truncate(str(r.get("condition") or ""), 180),
+                "action": _truncate(str(r.get("action") or ""), 180),
             }
         )
     return out
@@ -332,7 +332,7 @@ class NextDayPredictor:
             "reclaimed_prev_pdl": False,
             "oi": oi_features or {"ok": False},
         }
-        retrieved = retrieve_rulebook_rules(self.rulebook_path, retrieval_state, limit=35)
+        retrieved = retrieve_rulebook_rules(self.rulebook_path, retrieval_state, limit=18)
 
         prompt_payload = {
             "instrument": instrument,
@@ -346,7 +346,7 @@ class NextDayPredictor:
             "retrieved": {
                 "rulebook_version": retrieved.rulebook_version,
                 # Keep prompt small and stable (reduces Gemini JSON failures).
-                "rules": _compact_rules(retrieved.rules, limit=22),
+                "rules": _compact_rules(retrieved.rules, limit=12),
             },
         }
 
@@ -410,7 +410,7 @@ class NextDayPredictor:
                 "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 "targets": {"type": "array", "items": {"type": "number"}, "maxItems": 5},
                 "liquidity_pools": {"type": "array", "items": {"type": "number"}, "maxItems": 8},
-                "reason_points": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                "reason_points": {"type": "array", "items": {"type": "string", "maxLength": 180}, "maxItems": 4},
             },
             "required": ["bucket_key", "gap_points_min", "gap_points_max", "bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
         }
@@ -419,7 +419,7 @@ class NextDayPredictor:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "summary_points": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                "summary_points": {"type": "array", "items": {"type": "string", "maxLength": 220}, "maxItems": 8},
                 "base_levels": {
                     "type": "object",
                     "additionalProperties": False,
@@ -445,6 +445,7 @@ class NextDayPredictor:
             "You MUST output exactly 10 gap_plans (one per provided gap_buckets key). "
             "Be conservative: if unsure for a bucket, set bias=WAIT and set entry_zone/operator_zone/no_trade_zone/sl to null (targets/liquidity_pools/reason_points still required). "
             "Keep arrays small: targets max 3 numbers; liquidity_pools max 3 numbers; reason_points max 3 short points. "
+            "Keep each string very short (<= 180 chars). Do not repeat input payload. Do not add explanations outside JSON. "
             "All strings must be SINGLE-LINE (no raw newlines). If needed, use '\\n' inside strings. "
             "Output STRICT JSON only. No markdown. No comments. No trailing commas. Use double quotes for all JSON keys/strings."
         )
@@ -460,7 +461,7 @@ class NextDayPredictor:
             "contents": [{"role": "user", "parts": [{"text": json.dumps(prompt_payload, ensure_ascii=False)}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 4096,
                 "responseMimeType": "application/json",
                 # Use JSON Schema structured outputs for reliable JSON.
                 "responseJsonSchema": schema,
@@ -582,6 +583,13 @@ class NextDayPredictor:
                         out = _extract_json(text)
                         break
                     except Exception as pe:
+                        # If the candidate was truncated due to max tokens, increase token budget and retry.
+                        fb = _gemini_feedback(data)
+                        if fb.get("finish_reason") == "MAX_TOKENS" and attempt < int(self.max_retries):
+                            cur = int(body.get("generationConfig", {}).get("maxOutputTokens") or 4096)
+                            body["generationConfig"]["maxOutputTokens"] = min(cur * 2, 6144)
+                            time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
+                            continue
                         # If schema had to be dropped, parsing can still fail; retry a couple times.
                         if attempt < int(self.max_retries):
                             time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
@@ -599,7 +607,7 @@ class NextDayPredictor:
                     "contents": body["contents"],
                     "generationConfig": {
                         "temperature": 0,
-                        "maxOutputTokens": 900,
+                        "maxOutputTokens": 4096,
                         "responseMimeType": "application/json",
                     },
                 }
