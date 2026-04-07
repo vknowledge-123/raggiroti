@@ -13,6 +13,7 @@ from .prev_day_planner import PrevDayLevels
 class BacktestResult:
     realized_pnl_points: float
     fills: list
+    decisions: list | None = None
 
 
 def run_backtest(
@@ -22,10 +23,13 @@ def run_backtest(
     prev: PrevDayLevels | None = None,
     gap_threshold_points: float = 30.0,
     flat_threshold_points: float = 15.0,
+    include_decisions: bool = False,
+    max_decisions: int = 1200,
 ) -> BacktestResult:
     broker = BrokerSim()
     state_builder = StateBuilder()
     state_builder.on_new_day(prev=prev, gap_threshold_points=gap_threshold_points, flat_threshold_points=flat_threshold_points)
+    decisions: list[dict] | None = [] if include_decisions else None
 
     for c in candles:
         state = state_builder.update(c)
@@ -41,6 +45,32 @@ def run_backtest(
         }
 
         decision = policy.decide(state)
+        if decisions is not None and len(decisions) < int(max_decisions):
+            # Compute absolute SL/target from points for easier debugging.
+            entry = float(c.close)
+            sl_abs = None
+            t_abs = None
+            if decision.action == "BUY":
+                sl_abs = entry - float(decision.sl_points)
+                if decision.target_points is not None:
+                    t_abs = entry + float(decision.target_points)
+            elif decision.action == "SELL":
+                sl_abs = entry + float(decision.sl_points)
+                if decision.target_points is not None:
+                    t_abs = entry - float(decision.target_points)
+            raw = getattr(policy, "last_raw", None)
+            decisions.append(
+                {
+                    "dt": state["dt"],
+                    "action": decision.action,
+                    "sl_points": float(decision.sl_points),
+                    "target_points": None if decision.target_points is None else float(decision.target_points),
+                    "sl_abs": sl_abs,
+                    "t1_abs": t_abs,
+                    "reason": decision.reason,
+                    "raw": raw,
+                }
+            )
         if broker.position is not None:
             if decision.action == "EXIT":
                 broker.exit(state["dt"], c.close, decision.reason or "EXIT")
@@ -70,4 +100,4 @@ def run_backtest(
     if broker.position is not None:
         broker.exit(candles[-1].dt.isoformat(timespec="minutes"), candles[-1].close, "EOD")
 
-    return BacktestResult(realized_pnl_points=broker.realized_pnl_points, fills=broker.fills)
+    return BacktestResult(realized_pnl_points=broker.realized_pnl_points, fills=broker.fills, decisions=decisions)

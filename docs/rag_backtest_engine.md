@@ -199,6 +199,18 @@ Loop:
 - Optional: event-driven LLM calls only when the state is ambiguous (WAIT) and an event occurs (e.g., sweep+reclaim).
 - Always cache LLM outputs by request hash in SQLite so reruns are deterministic.
 
+## 5.2) Simulation-like per-candle Gemini backtest (gemini_all)
+
+If you want the backtest to behave **like the live simulator** (LLM decision on every 1-minute candle), use:
+
+- `policy=gemini_all`
+
+Notes:
+
+- This calls Gemini on every candle, so it is **slow and non-deterministic** (unless cache hits).
+- It is best used for **short date ranges** to validate that your rulebook + state-builder are aligned with your discretionary SL-hunting logic.
+- Web UI supports `include_decisions=1` to return per-candle decisions (use a low `max_decisions`).
+
 ## 6) Live trading engine (later)
 
 Same as backtest loop, but execution calls Dhan SDK instead of simulator.

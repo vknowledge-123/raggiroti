@@ -25,6 +25,7 @@ from raggiroti.backtest.scenario_policy import ScenarioPolicy
 from raggiroti.backtest.rulebook_scoring_policy import RulebookScoringPolicy
 from raggiroti.backtest.rag_policy import RAGPolicy
 from raggiroti.backtest.rag_policy_per_candle import PerCandleRAGPolicy
+from raggiroti.backtest.gemini_policy_per_candle import PerCandleGeminiPolicy
 from raggiroti.config import get_settings
 from raggiroti.dhan.session import DhanUnavailable, create_dhan_client
 from raggiroti.dhan.historical import DhanIntradayRequest, fetch_intraday_candles
@@ -264,6 +265,8 @@ def _compute_backtest_range_dhan(
     policy: str,
     include_fills: int,
     max_fills: int,
+    include_decisions: int = 0,
+    max_decisions: int = 300,
 ) -> dict:
     t0 = datetime.now(timezone.utc)
     settings = get_settings()
@@ -304,17 +307,30 @@ def _compute_backtest_range_dhan(
     total = 0.0
     total_candles = 0
     llm_meta = None
-    if policy in {"rag", "rag_all"}:
-        llm_meta = {
-            "policy": policy,
-            "per_candle_llm": policy == "rag_all",
-            "base_url": settings.llm_base_url,
-            "model": settings.openai_rule_extract_model,
-            "note": (
-                "rag_all calls the LLM on every candle (slow). "
-                "Use policy=rag for event-driven LLM calls (faster) or policy=rulebook for fully deterministic."
-            ),
-        }
+    if policy in {"rag", "rag_all", "gemini_all"}:
+        if policy == "gemini_all":
+            gemini_key = _get_gemini_api_key_raw(settings.db_path)
+            gemini_model = _get_gemini_decision_model_raw(settings.db_path) or "gemini-2.5-flash"
+            llm_meta = {
+                "policy": policy,
+                "per_candle_llm": True,
+                "provider": "gemini",
+                "model": gemini_model,
+                "note": "gemini_all calls Gemini on every candle (slow/expensive). Use rulebook for deterministic backtests.",
+                "gemini_configured": bool(gemini_key),
+            }
+        else:
+            llm_meta = {
+                "policy": policy,
+                "per_candle_llm": policy == "rag_all",
+                "provider": "openai_compatible",
+                "base_url": settings.llm_base_url,
+                "model": settings.openai_rule_extract_model,
+                "note": (
+                    "rag_all calls the LLM on every candle (slow). "
+                    "Use policy=rag for event-driven LLM calls (faster) or policy=rulebook for fully deterministic."
+                ),
+            }
 
     for i in range(s_idx, e_idx + 1):
         prev_date = dates[i - 1]
@@ -329,7 +345,18 @@ def _compute_backtest_range_dhan(
             flat_threshold_points=flat,
         )
 
-        if policy == "rag_all":
+        if policy == "gemini_all":
+            gemini_key = _get_gemini_api_key_raw(settings.db_path)
+            gemini_model = _get_gemini_decision_model_raw(settings.db_path) or "gemini-2.5-flash"
+            if not gemini_key:
+                return {"ok": False, "error": "missing gemini api key (required for gemini_all)"}
+            pol = PerCandleGeminiPolicy(
+                api_key=gemini_key,
+                model=gemini_model,
+                db_path=settings.db_path,
+                rulebook_path=settings.rulebook_path,
+            )
+        elif policy == "rag_all":
             pol = PerCandleRAGPolicy()
         elif policy == "rag":
             pol = RAGPolicy()
@@ -345,12 +372,17 @@ def _compute_backtest_range_dhan(
             prev=prev_levels,
             gap_threshold_points=gap,
             flat_threshold_points=flat,
+            include_decisions=bool(int(include_decisions)) or (policy in {"gemini_all", "rag_all"}),
+            max_decisions=int(max(50, int(max_decisions))),
         )
         total += res.realized_pnl_points
         item = {"date": date, "prev_date": prev_date, "scenario": scenario, "pnl_points_x_qty": res.realized_pnl_points}
         if include_fills:
             item["fills"] = [f.__dict__ for f in res.fills[: max(0, int(max_fills))]]
             item["fills_truncated"] = len(res.fills) > int(max_fills)
+        if bool(int(include_decisions)) and res.decisions is not None:
+            item["decisions"] = res.decisions[: max(0, int(max_decisions))]
+            item["decisions_truncated"] = len(res.decisions) > int(max_decisions)
         daily.append(item)
 
     elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
@@ -548,12 +580,17 @@ def home() -> str:
         <input name="gap" type="number" value="30" />
         <label>Flat threshold points</label>
         <input name="flat" type="number" value="15" />
-        <label>Policy (rulebook | rag | rag_all | scenario)</label>
+        <label>Policy (rulebook | rag | rag_all | gemini_all | scenario)</label>
         <input name="policy" value="rulebook" />
+        <p class="muted">Use <code>gemini_all</code> for simulation-like per-candle Gemini decisions (slow/expensive).</p>
         <label>Include fills (0/1)</label>
         <input name="include_fills" value="0" />
         <label>Max fills per day</label>
         <input name="max_fills" value="200" />
+        <label>Include decisions (0/1)</label>
+        <input name="include_decisions" value="0" />
+        <label>Max decisions per day</label>
+        <input name="max_decisions" value="300" />
         <div style="margin-top:12px;">
           <button type="button" onclick="runBacktestDhan()">Run Dhan backtest</button>
         </div>
@@ -705,8 +742,8 @@ def home() -> str:
         const policy = (fd.get('policy') || 'rulebook').toString();
         document.getElementById('outd').textContent =
           `Running backtest (policy=${policy})...` +
-          (policy === 'rag_all'
-            ? `\\nNote: rag_all calls the LLM on every 1-minute candle and can take a long time on a local CPU model.`
+          ((policy === 'rag_all' || policy === 'gemini_all')
+            ? `\\nNote: ${policy} calls the LLM on every 1-minute candle and can take a long time.`
             : '');
         try {
           // Submit as a background job so long runs don't die due to network/proxy timeouts.
@@ -1437,6 +1474,8 @@ async def backtest_range_dhan(
     policy: str = Form("rulebook"),  # rulebook | rag | rag_all | scenario
     include_fills: int = Form(0),
     max_fills: int = Form(200),
+    include_decisions: int = Form(0),
+    max_decisions: int = Form(300),
 ) -> JSONResponse:
     # Direct (non-job) execution endpoint. Prefer /submit + /job for long runs.
     fn = partial(
@@ -1453,6 +1492,8 @@ async def backtest_range_dhan(
         policy=policy,
         include_fills=include_fills,
         max_fills=max_fills,
+        include_decisions=include_decisions,
+        max_decisions=max_decisions,
     )
     result = await anyio.to_thread.run_sync(fn)
     status = 200 if result.get("ok") else 400
@@ -1473,6 +1514,8 @@ async def backtest_range_dhan_submit(
     policy: str = Form("rulebook"),
     include_fills: int = Form(0),
     max_fills: int = Form(200),
+    include_decisions: int = Form(0),
+    max_decisions: int = Form(300),
 ) -> JSONResponse:
     job_id = f"bt_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc).isoformat()
@@ -1497,6 +1540,8 @@ async def backtest_range_dhan_submit(
                 policy=policy,
                 include_fills=include_fills,
                 max_fills=max_fills,
+                include_decisions=include_decisions,
+                max_decisions=max_decisions,
             )
             result = await anyio.to_thread.run_sync(fn)
             job.result = result
