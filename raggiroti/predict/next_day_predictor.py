@@ -134,6 +134,38 @@ def _gemini_feedback(data: dict) -> dict:
     except Exception:
         return {}
 
+
+def _is_schema_related_400(resp: httpx.Response) -> bool:
+    """
+    Only drop generationConfig.responseJsonSchema on schema-related HTTP 400 responses.
+    Dropping schema on other errors (auth/model/etc) reduces reliability and hides root causes.
+    """
+    try:
+        if int(resp.status_code) != 400:
+            return False
+        j = resp.json()
+        msg = ""
+        if isinstance(j, dict):
+            err = j.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                msg = err.get("message") or ""
+            elif isinstance(j.get("message"), str):
+                msg = j.get("message") or ""
+        msg = (msg or "").lower()
+        return any(
+            k in msg
+            for k in (
+                "responsejsonschema",
+                "jsonschema",
+                "schema",
+                "unknown name",
+                "invalid json schema",
+                "invalid schema",
+            )
+        )
+    except Exception:
+        return False
+
 def _single_line(s: str) -> str:
     return (s or "").replace("\r", " ").replace("\n", " ").strip()
 
@@ -200,6 +232,7 @@ def _sanitize_prediction_output(out: dict) -> dict:
     for p in plans:
         if not isinstance(p, dict):
             continue
+        p = _ensure_bucket_plan_keys(p)
         bias = str(p.get("bias") or "WAIT").upper()
         if bias not in {"BUY", "SELL", "WAIT"}:
             bias = "WAIT"
@@ -236,11 +269,12 @@ def _sanitize_prediction_output(out: dict) -> dict:
                     cleaned.append(rr)
             cleaned = [_single_line(x) for x in cleaned if _single_line(x)][:3]
             if not cleaned:
-                cleaned = [
-                    (f"Bias={bias}: wait for sweep + reclaim (BUY) or sweep + reject (SELL) at key liquidity.")
-                    if bias in {"BUY", "SELL"}
-                    else "WAIT.",
-                ]
+                if bias == "BUY":
+                    cleaned = ["Bias=BUY: wait for sweep + reclaim at key liquidity levels."]
+                elif bias == "SELL":
+                    cleaned = ["Bias=SELL: wait for sweep + rejection at key liquidity levels."]
+                else:
+                    cleaned = ["WAIT."]
             p["reason_points"] = cleaned
 
         new_plans.append(p)
@@ -327,6 +361,20 @@ def _merge_single_bucket_into_fallback(single: dict, fallback: dict, expected_ke
     return fallback
 
 
+def _friendly_bucket_reason(why: str) -> str:
+    w = _single_line(str(why or ""))
+    lw = w.lower()
+    if "single_bucket" in lw:
+        return "Gemini returned an incomplete (single-bucket) plan; per-bucket planning used."
+    if "missing_" in lw or "invalid_shape" in lw:
+        return "Gemini output missed required fields; per-bucket planning used."
+    if "schema_dropped" in lw:
+        return "Structured-output schema was not applied; per-bucket planning used."
+    if not w:
+        return "Per-bucket planning used."
+    return f"Per-bucket planning used (reason={_truncate(w, 120)})."
+
+
 def _validate_full_prediction_shape(out: dict, expected_keys: list[str]) -> str | None:
     """
     Returns None if OK, else returns a short reason string.
@@ -363,6 +411,27 @@ def _replace_bucket_plan(out: dict, bucket_key: str, plan: dict) -> dict:
             break
     out["gap_plans"] = plans
     return out
+
+
+def _ensure_bucket_plan_keys(plan: dict) -> dict:
+    """
+    Ensure each bucket plan has all expected keys so downstream UI and sanitizers never crash,
+    even when Gemini returns partial JSON (common when schema is not applied).
+    """
+    if not isinstance(plan, dict):
+        return plan
+    plan.setdefault("bucket_key", "")
+    plan.setdefault("gap_points_min", None)
+    plan.setdefault("gap_points_max", None)
+    plan.setdefault("bias", "WAIT")
+    plan.setdefault("entry_zone", None)
+    plan.setdefault("operator_zone", None)
+    plan.setdefault("no_trade_zone", None)
+    plan.setdefault("sl", None)
+    plan.setdefault("targets", [])
+    plan.setdefault("liquidity_pools", [])
+    plan.setdefault("reason_points", [])
+    return plan
 
 
 def _coerce_prediction_shape(out: dict) -> dict:
@@ -842,7 +911,7 @@ class NextDayPredictor:
             "contents": [{"role": "user", "parts": [{"text": json.dumps(prompt_payload, ensure_ascii=False)}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": 6144,
                 "responseMimeType": "application/json",
                 # Structured outputs (JSON Schema) per Gemini API docs (REST: generationConfig.responseJsonSchema).
                 "responseJsonSchema": schema,
@@ -1043,7 +1112,7 @@ class NextDayPredictor:
                 last_err: str | None = None
                 for attempt in range(1, 3):
                     r = client.post(url, headers=headers, json=body_bucket)
-                    if r.status_code >= 400 and ("responseJsonSchema" in body_bucket["generationConfig"]):
+                    if _is_schema_related_400(r) and ("responseJsonSchema" in body_bucket["generationConfig"]):
                         body_bucket["generationConfig"].pop("responseJsonSchema", None)
                         r = client.post(url, headers=headers, json=body_bucket)
                     r.raise_for_status()
@@ -1063,7 +1132,7 @@ class NextDayPredictor:
                     outb["gap_points_min"] = None if bucket.get("min") is None else float(bucket.get("min"))
                     outb["gap_points_max"] = None if bucket.get("max") is None else float(bucket.get("max"))
                     outb["bias"] = _coerce_bias(outb.get("bias"))
-                    return outb, None
+                    return _ensure_bucket_plan_keys(outb), None
                 return None, _sanitize_error(last_err or "bucket_plan_failed")
             except Exception as e:
                 return None, _sanitize_error(str(e))
@@ -1085,9 +1154,9 @@ class NextDayPredictor:
                 _replace_bucket_plan(base_out, str(b.get("key")), plan)
 
             sp = [
-                "Bucket-level planning used (full-output schema failed).",
-                f"Reason: {why}",
-                "Some buckets may still use deterministic fallback if Gemini failed for that bucket.",
+                "Per-bucket Gemini planning used.",
+                _friendly_bucket_reason(why),
+                "Any bucket without Gemini output uses conservative defaults.",
             ]
             base_out["summary_points"] = sp[:8]
             base_out["_fallback"] = not any_llm
@@ -1104,7 +1173,7 @@ class NextDayPredictor:
             with httpx.Client(timeout=self.timeout_s) as client:
                 for attempt in range(1, int(self.max_retries) + 1):
                     r = client.post(url, headers=headers, json=body)
-                    if r.status_code >= 400 and ("responseJsonSchema" in body["generationConfig"]):
+                    if _is_schema_related_400(r) and ("responseJsonSchema" in body["generationConfig"]):
                         # Older deployments may not support schemas. Drop and retry.
                         body["generationConfig"].pop("responseJsonSchema", None)
                         schema_dropped = True
@@ -1132,8 +1201,8 @@ class NextDayPredictor:
                         # If the candidate was truncated due to max tokens, increase token budget and retry.
                         fb = _gemini_feedback(data)
                         if fb.get("finish_reason") == "MAX_TOKENS" and attempt < int(self.max_retries):
-                            cur = int(body.get("generationConfig", {}).get("maxOutputTokens") or 4096)
-                            body["generationConfig"]["maxOutputTokens"] = min(cur * 2, 6144)
+                            cur = int(body.get("generationConfig", {}).get("maxOutputTokens") or 6144)
+                            body["generationConfig"]["maxOutputTokens"] = min(cur * 2, 8192)
                             time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
                             continue
                         # If schema had to be dropped, parsing can still fail; retry a couple times.
@@ -1184,28 +1253,34 @@ class NextDayPredictor:
                         "contents": [{"role": "user", "parts": [{"text": json.dumps(repair_payload, ensure_ascii=False)}]}],
                         "generationConfig": {
                             "temperature": 0,
-                            "maxOutputTokens": 4096,
+                            "maxOutputTokens": 6144,
                             "responseMimeType": "application/json",
                             "responseJsonSchema": schema,
                         },
                     }
+                r3 = client.post(url, headers=headers, json=body_repair)
+                if _is_schema_related_400(r3) and ("responseJsonSchema" in body_repair["generationConfig"]):
+                    body_repair["generationConfig"].pop("responseJsonSchema", None)
                     r3 = client.post(url, headers=headers, json=body_repair)
-                    if r3.status_code >= 400 and ("responseJsonSchema" in body_repair["generationConfig"]):
-                        body_repair["generationConfig"].pop("responseJsonSchema", None)
-                        r3 = client.post(url, headers=headers, json=body_repair)
-                    r3.raise_for_status()
-                    data3 = r3.json()
-                    text3 = _extract_candidate_text(data3)
-                    out3 = _extract_json(text3)
-                    out3 = _coerce_prediction_shape(out3 if isinstance(out3, dict) else {})
-                    # Merge partial repair output if needed (common: missing summary_points).
-                    out3m = _merge_partial_prediction_into_fallback(out3, _fallback_prediction(f"partial_merge_repair:{bad}"), expected_keys)
-                    bad3 = _validate_full_prediction_shape(out3m, expected_keys)
-                    if bad3 is None:
-                        out = out3m
-                    else:
-                        # Final fallback: build full plan via per-bucket Gemini calls (much more reliable).
-                        out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad}->{bad3}" + (" (schema_dropped)" if schema_dropped else ""))
+                r3.raise_for_status()
+                data3 = r3.json()
+                text3 = _extract_candidate_text(data3)
+                out3 = _extract_json(text3)
+                out3 = _coerce_prediction_shape(out3 if isinstance(out3, dict) else {})
+                # Merge partial repair output if needed (common: missing summary_points).
+                out3m = _merge_partial_prediction_into_fallback(
+                    out3, _fallback_prediction(f"partial_merge_repair:{bad}"), expected_keys
+                )
+                bad3 = _validate_full_prediction_shape(out3m, expected_keys)
+                if bad3 is None:
+                    out = out3m
+                else:
+                    # Final fallback: build full plan via per-bucket Gemini calls (much more reliable).
+                    out = _bucket_level_plans(
+                        client,
+                        f"gemini_invalid_shape:{bad}->{bad3}"
+                        + (" (schema_dropped)" if schema_dropped else ""),
+                    )
         except Exception as e:
             last_err = _sanitize_error(str(e))
             # One parse retry: no schema.
@@ -1215,7 +1290,7 @@ class NextDayPredictor:
                     "contents": body["contents"],
                     "generationConfig": {
                         "temperature": 0,
-                        "maxOutputTokens": 4096,
+                        "maxOutputTokens": 6144,
                         "responseMimeType": "application/json",
                     },
                 }

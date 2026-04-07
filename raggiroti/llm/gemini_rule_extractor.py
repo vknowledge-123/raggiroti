@@ -33,13 +33,61 @@ def _extract_json(text: str) -> dict:
     text = (text or "").strip()
     if not text:
         raise ValueError("empty response")
+    # 1) direct parse
     try:
         return json.loads(text)
     except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
+        pass
+
+    # 2) try to extract the first balanced JSON object substring
+    def _balanced_object(s: str) -> str | None:
+        i = s.find("{")
+        if i < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, len(s)):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[i : j + 1]
+        return None
+
+    cand = _balanced_object(text)
+    if cand:
+        try:
+            return json.loads(cand)
+        except Exception:
+            text = cand
+
+    # 3) heuristic repairs for common "almost JSON" mistakes
+    repaired = text
+    repaired = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', repaired)
+    repaired = repaired.replace(": None", ": null").replace(": True", ": true").replace(": False", ": false")
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        m = re.search(r"\{.*\}", repaired, re.DOTALL)
         if not m:
             raise
-    return json.loads(m.group(0))
+        return json.loads(m.group(0))
 
 def _normalize_model_id(model: str) -> str:
     m = (model or "").strip()
@@ -68,6 +116,38 @@ def _gemini_feedback(data: dict) -> dict:
         }
     except Exception:
         return {}
+
+
+def _is_schema_related_400(resp: httpx.Response) -> bool:
+    """
+    Some Gemini deployments reject generationConfig.responseJsonSchema with HTTP 400.
+    We only drop the schema in that specific case (not on auth/model/other errors).
+    """
+    try:
+        if int(resp.status_code) != 400:
+            return False
+        j = resp.json()
+        msg = ""
+        if isinstance(j, dict):
+            err = j.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                msg = err.get("message") or ""
+            elif isinstance(j.get("message"), str):
+                msg = j.get("message") or ""
+        msg = (msg or "").lower()
+        return any(
+            k in msg
+            for k in (
+                "responsejsonschema",
+                "jsonschema",
+                "schema",
+                "unknown name",
+                "invalid json schema",
+                "invalid schema",
+            )
+        )
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -161,7 +241,7 @@ class GeminiRuleExtractor:
             for attempt in range(1, int(self.max_retries) + 1):
                 try:
                     r = client.post(url, headers=headers, json=body)
-                    if r.status_code >= 400 and ("responseJsonSchema" in body["generationConfig"]):
+                    if _is_schema_related_400(r) and ("responseJsonSchema" in body["generationConfig"]):
                         # Older deployments may not support schemas; retry without it.
                         body["generationConfig"].pop("responseJsonSchema", None)
                         r = client.post(url, headers=headers, json=body)
@@ -181,7 +261,7 @@ class GeminiRuleExtractor:
                     break
                 except ValueError as e:
                     last_err = _sanitize_error(str(e))
-                    if str(e) == "empty_candidate_text" and attempt < int(self.max_retries):
+                    if str(e).startswith("empty_candidate_text") and attempt < int(self.max_retries):
                         time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
                         continue
                     break
