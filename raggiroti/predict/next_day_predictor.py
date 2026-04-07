@@ -364,6 +364,138 @@ def _replace_bucket_plan(out: dict, bucket_key: str, plan: dict) -> dict:
     out["gap_plans"] = plans
     return out
 
+
+def _coerce_prediction_shape(out: dict) -> dict:
+    """
+    Accept common near-misses from Gemini and coerce to our expected shape:
+    - "summary" -> "summary_points"
+    - "summaryPoints" -> "summary_points"
+    - "baseLevels" -> "base_levels"
+    - "baseLevels"/"base_levels" casing variants
+    - "gap_plans" as object map -> list with bucket_key
+    - "gapPlans" -> "gap_plans"
+    This runs BEFORE validation.
+    """
+    if not isinstance(out, dict):
+        return out
+
+    # Summary: accept common key variants and types.
+    if "summary_points" not in out and isinstance(out.get("summaryPoints"), list):
+        out["summary_points"] = out.get("summaryPoints")
+    if "summary_points" not in out and isinstance(out.get("summaryPoints"), str):
+        out["summary_points"] = [out.get("summaryPoints")]
+    if "summary_points" not in out and isinstance(out.get("summary"), str):
+        out["summary_points"] = [out.get("summary")]
+    if isinstance(out.get("summary_points"), str):
+        out["summary_points"] = [out.get("summary_points")]
+
+    # Base levels: accept camelCase.
+    if "base_levels" not in out and isinstance(out.get("baseLevels"), dict):
+        out["base_levels"] = out.get("baseLevels")
+    if "base_levels" not in out and isinstance(out.get("base_levels"), dict):
+        out["base_levels"] = out.get("base_levels")
+
+    # Gap plans: accept camelCase and object-map shapes.
+    if "gap_plans" not in out and isinstance(out.get("gapPlans"), list):
+        out["gap_plans"] = out.get("gapPlans")
+    if "gap_plans" not in out and isinstance(out.get("gapPlans"), dict):
+        out["gap_plans"] = out.get("gapPlans")
+
+    if isinstance(out.get("gap_plans"), dict):
+        plans = []
+        for k, v in (out.get("gap_plans") or {}).items():
+            if isinstance(v, dict):
+                v2 = dict(v)
+                v2.setdefault("bucket_key", str(k))
+                plans.append(v2)
+        out["gap_plans"] = plans
+
+    return out
+
+
+def _merge_partial_prediction_into_fallback(out: dict, fallback: dict, expected_keys: list[str]) -> dict:
+    """
+    Gemini sometimes returns valid JSON but misses a top-level key (often summary_points) or
+    returns incomplete bucket objects. Instead of hard-failing into deterministic fallback,
+    merge whatever Gemini produced into the deterministic baseline so UI still gets all regimes.
+
+    This is NOT the same as "bucket-level planning" (which makes 11 Gemini calls). This keeps
+    the original Gemini call result and only fills missing pieces.
+    """
+    if not isinstance(out, dict) or not isinstance(fallback, dict):
+        return fallback
+
+    merged = dict(fallback)
+    changed = False
+
+    # summary_points
+    sp = out.get("summary_points")
+    if isinstance(sp, list):
+        merged["summary_points"] = sp
+    elif isinstance(sp, str):
+        merged["summary_points"] = [sp]
+        changed = True
+    else:
+        # Auto-fill a minimal summary if Gemini omitted it but provided something else.
+        if any(k in out for k in ("base_levels", "gap_plans", "gap_bucket", "bucket_key")):
+            merged["summary_points"] = [
+                "Gemini output missing summary_points; auto-filled.",
+                "See bucket-wise plans for regime-specific levels.",
+            ]
+            changed = True
+
+    # base_levels
+    bl = out.get("base_levels")
+    if isinstance(bl, dict):
+        merged["base_levels"] = {**merged.get("base_levels", {}), **bl}
+
+    # gap_plans
+    plans_in = out.get("gap_plans")
+    plan_map: dict[str, dict] = {}
+    if isinstance(plans_in, list):
+        for p in plans_in:
+            if isinstance(p, dict):
+                k = p.get("bucket_key") or p.get("gap_bucket") or p.get("bucket")
+                if isinstance(k, str) and k:
+                    plan_map[k] = p
+
+    plans_out = []
+    fb_plans = merged.get("gap_plans")
+    fb_map: dict[str, dict] = {}
+    if isinstance(fb_plans, list):
+        for p in fb_plans:
+            if isinstance(p, dict) and isinstance(p.get("bucket_key"), str):
+                fb_map[p["bucket_key"]] = p
+
+    for k in expected_keys:
+        base = dict(fb_map.get(k) or {"bucket_key": k})
+        p = plan_map.get(k)
+        if isinstance(p, dict):
+            base.update(p)
+        base["bucket_key"] = k
+        # Ensure bias is normalized even if schema was not enforced.
+        base["bias"] = _coerce_bias(base.get("bias"))
+        plans_out.append(base)
+        if p is not None and p is not fb_map.get(k):
+            changed = True
+
+    merged["gap_plans"] = plans_out
+
+    if changed:
+        sp2 = merged.get("summary_points")
+        if not isinstance(sp2, list):
+            sp2 = []
+        sp2 = list(sp2)[:6]
+        sp2.append("Gemini output was partially merged with fallback to satisfy full regime schema.")
+        merged["summary_points"] = sp2[:8]
+        merged["_partial_merge"] = True
+
+    # If we got ANY meaningful Gemini signal, this should not be considered a full deterministic fallback.
+    if any(k in out for k in ("summary_points", "base_levels", "gap_plans", "gap_bucket", "bucket_key")):
+        merged["_fallback"] = False
+
+    return merged
+
 def _truncate(s: str, n: int = 240) -> str:
     s = (s or "").strip()
     if len(s) <= n:
@@ -639,20 +771,7 @@ class NextDayPredictor:
 
         bucket_schema = {
             "type": "object",
-            "additionalProperties": False,
-            "propertyOrdering": [
-                "bucket_key",
-                "gap_points_min",
-                "gap_points_max",
-                "bias",
-                "entry_zone",
-                "operator_zone",
-                "no_trade_zone",
-                "sl",
-                "targets",
-                "liquidity_pools",
-                "reason_points",
-            ],
+            # Keep schema minimal; some Gemini deployments reject minItems/maxItems and will 400 -> schema dropped.
             "properties": {
                 "bucket_key": {"type": "string"},
                 "gap_points_min": {"type": ["number", "null"]},
@@ -661,50 +780,41 @@ class NextDayPredictor:
                 "entry_zone": {
                     "type": ["array", "null"],
                     "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
                 },
                 "operator_zone": {
                     "type": ["array", "null"],
                     "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
                 },
                 "no_trade_zone": {
                     "type": ["array", "null"],
                     "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
                 },
                 "sl": {"type": ["number", "null"]},
-                "targets": {"type": "array", "items": {"type": "number"}, "maxItems": 5},
-                "liquidity_pools": {"type": "array", "items": {"type": "number"}, "maxItems": 8},
-                "reason_points": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                "targets": {"type": "array", "items": {"type": "number"}},
+                "liquidity_pools": {"type": "array", "items": {"type": "number"}},
+                "reason_points": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["bucket_key", "gap_points_min", "gap_points_max", "bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
         }
 
         schema = {
             "type": "object",
-            "additionalProperties": False,
-            "propertyOrdering": ["summary_points", "base_levels", "gap_plans"],
+            # Keep schema minimal for maximum compatibility with Gemini structured outputs.
             "properties": {
-                "summary_points": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                "summary_points": {"type": "array", "items": {"type": "string"}},
                 "base_levels": {
                     "type": "object",
-                    "additionalProperties": False,
-                    "propertyOrdering": ["prev_close", "PDH", "PDL", "operator_sell_zone", "operator_buy_zone", "no_trade_zone"],
                     "properties": {
                         "prev_close": {"type": "number"},
                         "PDH": {"type": "number"},
                         "PDL": {"type": "number"},
-                        "operator_sell_zone": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                        "operator_buy_zone": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-                        "no_trade_zone": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                        "operator_sell_zone": {"type": "array", "items": {"type": "number"}},
+                        "operator_buy_zone": {"type": "array", "items": {"type": "number"}},
+                        "no_trade_zone": {"type": "array", "items": {"type": "number"}},
                     },
                     "required": ["prev_close", "PDH", "PDL", "operator_sell_zone", "operator_buy_zone", "no_trade_zone"],
                 },
-                "gap_plans": {"type": "array", "items": bucket_schema, "minItems": 11, "maxItems": 11},
+                "gap_plans": {"type": "array", "items": bucket_schema},
             },
             "required": ["summary_points", "base_levels", "gap_plans"],
         }
@@ -871,20 +981,6 @@ class NextDayPredictor:
 
             bucket_only_schema = {
                 "type": "object",
-                "additionalProperties": False,
-                "propertyOrdering": [
-                    "bucket_key",
-                    "gap_points_min",
-                    "gap_points_max",
-                    "bias",
-                    "entry_zone",
-                    "operator_zone",
-                    "no_trade_zone",
-                    "sl",
-                    "targets",
-                    "liquidity_pools",
-                    "reason_points",
-                ],
                 "properties": {
                     "bucket_key": {"type": "string"},
                     "gap_points_min": {"type": ["number", "null"]},
@@ -893,25 +989,19 @@ class NextDayPredictor:
                     "entry_zone": {
                         "type": ["array", "null"],
                         "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
                     },
                     "operator_zone": {
                         "type": ["array", "null"],
                         "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
                     },
                     "no_trade_zone": {
                         "type": ["array", "null"],
                         "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
                     },
                     "sl": {"type": ["number", "null"]},
-                    "targets": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3},
-                    "liquidity_pools": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3},
-                    "reason_points": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                    "targets": {"type": "array", "items": {"type": "number"}},
+                    "liquidity_pools": {"type": "array", "items": {"type": "number"}},
+                    "reason_points": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": [
                     "bucket_key",
@@ -950,21 +1040,31 @@ class NextDayPredictor:
             }
 
             try:
-                r = client.post(url, headers=headers, json=body_bucket)
-                if r.status_code >= 400 and ("responseJsonSchema" in body_bucket["generationConfig"]):
-                    body_bucket["generationConfig"].pop("responseJsonSchema", None)
+                last_err: str | None = None
+                for attempt in range(1, 3):
                     r = client.post(url, headers=headers, json=body_bucket)
-                r.raise_for_status()
-                data = r.json()
-                text = _extract_candidate_text(data)
-                outb = _extract_json(text)
-                if not isinstance(outb, dict):
-                    return None, "bucket_output_not_object"
-                outb["bucket_key"] = bkey
-                outb["gap_points_min"] = None if bucket.get("min") is None else float(bucket.get("min"))
-                outb["gap_points_max"] = None if bucket.get("max") is None else float(bucket.get("max"))
-                outb["bias"] = _coerce_bias(outb.get("bias"))
-                return outb, None
+                    if r.status_code >= 400 and ("responseJsonSchema" in body_bucket["generationConfig"]):
+                        body_bucket["generationConfig"].pop("responseJsonSchema", None)
+                        r = client.post(url, headers=headers, json=body_bucket)
+                    r.raise_for_status()
+                    data = r.json()
+                    text = _extract_candidate_text(data)
+                    if not text:
+                        fb = _gemini_feedback(data)
+                        last_err = f"empty_candidate_text:{json.dumps(fb, ensure_ascii=False)}"
+                        time.sleep(0.2 * attempt)
+                        continue
+                    outb = _extract_json(text)
+                    if not isinstance(outb, dict):
+                        last_err = "bucket_output_not_object"
+                        time.sleep(0.2 * attempt)
+                        continue
+                    outb["bucket_key"] = bkey
+                    outb["gap_points_min"] = None if bucket.get("min") is None else float(bucket.get("min"))
+                    outb["gap_points_max"] = None if bucket.get("max") is None else float(bucket.get("max"))
+                    outb["bias"] = _coerce_bias(outb.get("bias"))
+                    return outb, None
+                return None, _sanitize_error(last_err or "bucket_plan_failed")
             except Exception as e:
                 return None, _sanitize_error(str(e))
 
@@ -1045,45 +1145,61 @@ class NextDayPredictor:
             if out is None:
                 raise RuntimeError("gemini_error: empty_or_unparseable_response" + (" (schema_dropped)" if schema_dropped else ""))
 
+            # Coerce common key variants before validation/repair logic.
+            out = _coerce_prediction_shape(out if isinstance(out, dict) else {})
+
+            # If Gemini returned a single-bucket legacy output, merge it into full-bucket fallback.
+            if _looks_like_single_bucket_output(out):
+                out = _merge_single_bucket_into_fallback(out, _fallback_prediction("single_bucket_output"), expected_keys)
+
             # Validate shape; if Gemini returned a single bucket or wrong schema, try one repair call.
             bad = _validate_full_prediction_shape(out, expected_keys)
             if bad is not None:
-                # Attempt a repair call (still small; reuses same prompt payload).
-                repair_payload = {
-                    "note": "The previous output did not match the required schema. Re-emit strictly per schema.",
-                    "expected_bucket_keys": expected_keys,
-                    "gap_buckets": gap_buckets,
-                    "prev_levels": prompt_payload.get("prev_levels"),
-                    "stats": prompt_payload.get("stats"),
-                    "oi": prompt_payload.get("oi"),
-                    "retrieved": prompt_payload.get("retrieved"),
-                    "previous_output": out,
-                }
-                body_repair = {
-                    "systemInstruction": body.get("systemInstruction"),
-                    "safetySettings": body.get("safetySettings"),
-                    "contents": [{"role": "user", "parts": [{"text": json.dumps(repair_payload, ensure_ascii=False)}]}],
-                    "generationConfig": {
-                        "temperature": 0,
-                        "maxOutputTokens": 4096,
-                        "responseMimeType": "application/json",
-                        "responseJsonSchema": schema,
-                    },
-                }
-                r3 = client.post(url, headers=headers, json=body_repair)
-                if r3.status_code >= 400 and ("responseJsonSchema" in body_repair["generationConfig"]):
-                    body_repair["generationConfig"].pop("responseJsonSchema", None)
-                    r3 = client.post(url, headers=headers, json=body_repair)
-                r3.raise_for_status()
-                data3 = r3.json()
-                text3 = _extract_candidate_text(data3)
-                out3 = _extract_json(text3)
-                bad3 = _validate_full_prediction_shape(out3, expected_keys)
-                if bad3 is None:
-                    out = out3
+                # If only small parts are missing (e.g., summary_points), merge partial output into fallback first.
+                merged0 = _merge_partial_prediction_into_fallback(out, _fallback_prediction(f"partial_merge:{bad}"), expected_keys)
+                bad0 = _validate_full_prediction_shape(merged0, expected_keys)
+                if bad0 is None:
+                    out = merged0
                 else:
-                    # Final fallback: build full plan via per-bucket Gemini calls (much more reliable).
-                    out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad}->{bad3}")
+                # Attempt a repair call (still small; reuses same prompt payload).
+                    repair_payload = {
+                        "note": "The previous output did not match the required schema. Re-emit strictly per schema.",
+                        "expected_bucket_keys": expected_keys,
+                        "gap_buckets": gap_buckets,
+                        "prev_levels": prompt_payload.get("prev_levels"),
+                        "stats": prompt_payload.get("stats"),
+                        "oi": prompt_payload.get("oi"),
+                        "retrieved": prompt_payload.get("retrieved"),
+                        "previous_output": out,
+                    }
+                    body_repair = {
+                        "systemInstruction": body.get("systemInstruction"),
+                        "safetySettings": body.get("safetySettings"),
+                        "contents": [{"role": "user", "parts": [{"text": json.dumps(repair_payload, ensure_ascii=False)}]}],
+                        "generationConfig": {
+                            "temperature": 0,
+                            "maxOutputTokens": 4096,
+                            "responseMimeType": "application/json",
+                            "responseJsonSchema": schema,
+                        },
+                    }
+                    r3 = client.post(url, headers=headers, json=body_repair)
+                    if r3.status_code >= 400 and ("responseJsonSchema" in body_repair["generationConfig"]):
+                        body_repair["generationConfig"].pop("responseJsonSchema", None)
+                        r3 = client.post(url, headers=headers, json=body_repair)
+                    r3.raise_for_status()
+                    data3 = r3.json()
+                    text3 = _extract_candidate_text(data3)
+                    out3 = _extract_json(text3)
+                    out3 = _coerce_prediction_shape(out3 if isinstance(out3, dict) else {})
+                    # Merge partial repair output if needed (common: missing summary_points).
+                    out3m = _merge_partial_prediction_into_fallback(out3, _fallback_prediction(f"partial_merge_repair:{bad}"), expected_keys)
+                    bad3 = _validate_full_prediction_shape(out3m, expected_keys)
+                    if bad3 is None:
+                        out = out3m
+                    else:
+                        # Final fallback: build full plan via per-bucket Gemini calls (much more reliable).
+                        out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad}->{bad3}" + (" (schema_dropped)" if schema_dropped else ""))
         except Exception as e:
             last_err = _sanitize_error(str(e))
             # One parse retry: no schema.
@@ -1103,10 +1219,18 @@ class NextDayPredictor:
                     data2 = r2.json()
                 text2 = _extract_candidate_text(data2)
                 out = _extract_json(text2)
+                out = _coerce_prediction_shape(out if isinstance(out, dict) else {})
+                if _looks_like_single_bucket_output(out):
+                    out = _merge_single_bucket_into_fallback(out, _fallback_prediction("single_bucket_output_no_schema"), expected_keys)
                 bad2 = _validate_full_prediction_shape(out, expected_keys)
                 if bad2 is not None:
-                    # If schema isn't working, go bucket-by-bucket to guarantee full regime output.
-                    out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad2}")
+                    # Try partial merge first; if still invalid, go bucket-by-bucket to guarantee full regime output.
+                    merged2 = _merge_partial_prediction_into_fallback(out, _fallback_prediction(f"partial_merge_no_schema:{bad2}"), expected_keys)
+                    bad2m = _validate_full_prediction_shape(merged2, expected_keys)
+                    if bad2m is None:
+                        out = merged2
+                    else:
+                        out = _bucket_level_plans(client, f"gemini_invalid_shape:{bad2}" )
                 last_err = None
             except Exception as e2:
                 last_err = f"{last_err} / retry_failed: {_sanitize_error(str(e2))}"
