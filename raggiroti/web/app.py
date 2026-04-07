@@ -14,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anyio
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi import Body
 
@@ -1428,6 +1428,56 @@ def rag_reindex() -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     store.close()
     return JSONResponse({"ok": True, "rulebook_version": rb.version, "indexed_rules": n})
+
+
+@app.get("/api/rulebook/rules")
+def rulebook_rules(
+    ids: str = Query(..., description="Comma-separated rule ids (e.g. DT-DOW-001,DT-SL-022)"),
+    compact: int = Query(1, description="1=compact fields, 0=full rule objects"),
+) -> JSONResponse:
+    """
+    Helper for UI/debugging: expands rule ids to actual rulebook entries.
+    Useful to answer: "which 25 rules were retrieved on this candle?"
+    """
+    settings = get_settings()
+    rb = load_rulebook(settings.rulebook_path)
+    want = [s.strip() for s in (ids or "").split(",") if s.strip()]
+    if not want:
+        return JSONResponse({"ok": False, "error": "ids is required"}, status_code=400)
+    want_set = set(want)
+
+    out = []
+    for r in rb.raw.get("rules", []):
+        rid = str(r.get("id") or "")
+        if rid in want_set:
+            if int(compact):
+                out.append(
+                    {
+                        "id": r.get("id"),
+                        "category": r.get("category"),
+                        "name": r.get("name"),
+                        "tags": r.get("tags") or [],
+                        "condition": r.get("condition"),
+                        "action": r.get("action"),
+                    }
+                )
+            else:
+                out.append(r)
+
+    # Preserve the input order (best-effort)
+    by_id = {str(r.get("id")): r for r in out}
+    ordered = [by_id[i] for i in want if i in by_id]
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "rulebook_version": rb.version,
+            "requested": want,
+            "found": len(ordered),
+            "missing": [i for i in want if i not in by_id],
+            "rules": ordered,
+        }
+    )
 
 
 @app.post("/api/sim/candle")
