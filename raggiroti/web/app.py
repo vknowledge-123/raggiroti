@@ -88,6 +88,9 @@ LIVE_LAST_ERROR: str | None = None
 LIVE_ERRORS_LOCK = threading.Lock()
 LIVE_ERRORS: list[dict] = []
 LIVE_ERRORS_MAX = 200
+LIVE_TICK_COUNT = 0
+LIVE_LAST_TICK_AT: str | None = None
+LIVE_FEED_CONFIG: dict | None = None
 
 SIM_ENGINE: LiveSimEngine | None = None
 
@@ -1085,6 +1088,10 @@ def _start_live_thread(
     LIVE_LAST_ERROR = None
     with LIVE_ERRORS_LOCK:
         LIVE_ERRORS.clear()
+    global LIVE_TICK_COUNT, LIVE_LAST_TICK_AT, LIVE_FEED_CONFIG
+    LIVE_TICK_COUNT = 0
+    LIVE_LAST_TICK_AT = None
+    LIVE_FEED_CONFIG = None
     with LIVE_LOCK:
         LIVE_FEED = None
     LIVE_ENGINE = LiveSimEngine(symbol=symbol, security_id=security_id, gemini_api_key=gemini_key, gemini_model=gemini_model, qty=qty)
@@ -1113,19 +1120,27 @@ def _start_live_thread(
         # DhanHQ-py (stable 2.0.2) provides constants in `dhanhq.marketfeed`.
         try:
             from dhanhq import marketfeed  # type: ignore
-            sub_type = marketfeed.Full
             # Indices (NIFTY/BANKNIFTY) are on the IDX exchange segment in Dhan MarketFeed.
             # Using NSE here will subscribe to an equity with the same security_id and produce wrong prices.
             sym0 = (symbol or "").upper().strip()
             if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"}:
                 exch = marketfeed.IDX
+                # For indices, TICKER is the most reliable/fast stream (LTP only).
+                # We can still build 1m OHLC candles from LTP ticks.
+                sub_type = marketfeed.Ticker
             else:
                 exch = marketfeed.NSE
+                sub_type = marketfeed.Full
         except Exception:
             # Fallback defaults (may be wrong for some segments).
-            sub_type = 2
             sym0 = (symbol or "").upper().strip()
             exch = 0 if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"} else 1
+            sub_type = 15 if exch == 0 else 21
+        try:
+            global LIVE_FEED_CONFIG
+            LIVE_FEED_CONFIG = {"exchange_segment": int(exch), "subscription_type": int(sub_type)}
+        except Exception:
+            pass
 
         feed = None
         try:
@@ -1150,6 +1165,12 @@ def _start_live_thread(
                     return
                 if sec and sec != security_id:
                     return
+                try:
+                    global LIVE_TICK_COUNT, LIVE_LAST_TICK_AT
+                    LIVE_TICK_COUNT += 1
+                    LIVE_LAST_TICK_AT = dt.isoformat(timespec="seconds")
+                except Exception:
+                    pass
                 tick = Tick(dt=dt, security_id=security_id, ltp=ltp, volume=vol)
                 cb = LIVE_CANDLE_BUILDER
                 eng = LIVE_ENGINE
@@ -1320,6 +1341,13 @@ def live_stop() -> JSONResponse:
     with LIVE_ERRORS_LOCK:
         LIVE_ERRORS.clear()
     try:
+        global LIVE_TICK_COUNT, LIVE_LAST_TICK_AT, LIVE_FEED_CONFIG
+        LIVE_TICK_COUNT = 0
+        LIVE_LAST_TICK_AT = None
+        LIVE_FEED_CONFIG = None
+    except Exception:
+        pass
+    try:
         if t0 is not None and t0.is_alive():
             t0.join(timeout=1.2)
     except Exception:
@@ -1345,6 +1373,9 @@ def live_status() -> JSONResponse:
                 "thread_alive": bool(LIVE_THREAD is not None and LIVE_THREAD.is_alive()),
                 "stop_set": bool(LIVE_STOP.is_set()),
                 "engine_present": bool(LIVE_ENGINE is not None),
+                "tick_count": int(LIVE_TICK_COUNT),
+                "last_tick_at": LIVE_LAST_TICK_AT,
+                "feed_config": LIVE_FEED_CONFIG,
             }
         )
     st = LIVE_ENGINE.status()
@@ -1362,6 +1393,9 @@ def live_status() -> JSONResponse:
             "thread_alive": bool(LIVE_THREAD is not None and LIVE_THREAD.is_alive()),
             "stop_set": bool(LIVE_STOP.is_set()),
             "engine_present": bool(LIVE_ENGINE is not None),
+            "tick_count": int(LIVE_TICK_COUNT),
+            "last_tick_at": LIVE_LAST_TICK_AT,
+            "feed_config": LIVE_FEED_CONFIG,
         }
     )
 
