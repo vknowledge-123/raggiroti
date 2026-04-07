@@ -859,16 +859,15 @@ def _start_live_thread(
 
     def _run() -> None:
         # NOTE: use Quote or Full to get volume (Full typically contains more fields).
+        # DhanHQ-py (stable 2.0.2) provides constants in `dhanhq.marketfeed`.
         try:
-            from dhanhq import MarketFeed  # type: ignore
+            from dhanhq import marketfeed  # type: ignore
+            sub_type = marketfeed.Full
+            exch = marketfeed.NSE
         except Exception:
-            MarketFeed = None
-
-        sub_type = 2
-        exch = 1
-        if MarketFeed is not None:
-            sub_type = MarketFeed.Full
-            exch = MarketFeed.NSE
+            # Fallback defaults (may be wrong for some segments).
+            sub_type = 2
+            exch = 1
 
         feed = None
         try:

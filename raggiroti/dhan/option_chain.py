@@ -25,18 +25,42 @@ def _to_float(x) -> float | None:
 
 class DhanOptionChainClient:
     def __init__(self, *, client_id: str, access_token: str) -> None:
+        """
+        Supports stable DhanHQ-py (PyPI 2.0.2) style:
+          from dhanhq import dhanhq
+          dhan = dhanhq(client_id, access_token)
+          dhan.expiry_list(...)
+          dhan.option_chain(...)
+
+        Also supports newer modular SDK style if present.
+        """
+        last_err: Exception | None = None
+        try:
+            from dhanhq import dhanhq  # type: ignore
+            self._client = dhanhq(client_id, access_token)
+            self._mode = "client"
+            return
+        except Exception as e:
+            last_err = e
+
         try:
             from dhanhq import DhanContext, OptionChain  # type: ignore
+            ctx = DhanContext(client_id, access_token)
+            self._client = OptionChain(ctx)
+            self._mode = "class"
+            return
         except Exception as e:  # pragma: no cover
-            raise DhanUnavailable("Dhan SDK not installed. Install 'dhanhq'.") from e
-        self._ctx = DhanContext(client_id, access_token)
-        self._oc = OptionChain(self._ctx)
+            raise DhanUnavailable(f"Dhan SDK import/init failed. Root error: {last_err} / {e}") from e
 
     def expiry_list(self, *, under_security_id: int, under_exchange_segment: str) -> dict:
-        return self._oc.expiry_list(under_security_id, under_exchange_segment)
+        if getattr(self, "_mode", "") == "client":
+            return self._client.expiry_list(under_security_id=under_security_id, under_exchange_segment=under_exchange_segment)
+        return self._client.expiry_list(under_security_id, under_exchange_segment)
 
     def option_chain(self, *, under_security_id: int, under_exchange_segment: str, expiry: str) -> dict:
-        return self._oc.option_chain(under_security_id, under_exchange_segment, expiry)
+        if getattr(self, "_mode", "") == "client":
+            return self._client.option_chain(under_security_id=under_security_id, under_exchange_segment=under_exchange_segment, expiry=expiry)
+        return self._client.option_chain(under_security_id, under_exchange_segment, expiry)
 
 
 def summarize_oi_walls(option_chain_resp: dict, top_n: int = 5) -> dict:

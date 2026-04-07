@@ -42,16 +42,34 @@ class DhanLiveFeed:
     """
 
     def __init__(self, *, client_id: str, access_token: str, instruments: list[LiveFeedInstrument]) -> None:
+        """
+        DhanHQ PyPI latest stable is 2.0.2 (as of 2026-04), which exposes live feed via:
+          from dhanhq import marketfeed
+          marketfeed.DhanFeed(client_id, access_token, instruments, version="v2")
+
+        DhanHQ repo mentions newer import paths (DhanContext/MarketFeed) but those releases
+        were yanked/pre-release; so we support the stable path primarily.
+        """
+        self._instruments = [(i.exchange_segment, i.security_id, i.subscription_type) for i in instruments]
+
+        # Prefer stable marketfeed module.
+        try:
+            from dhanhq import marketfeed  # type: ignore
+            self._feed = marketfeed.DhanFeed(client_id, access_token, self._instruments, "v2")
+            self._mode = "marketfeed"
+            return
+        except Exception as e:
+            last_err = e
+
+        # Fallback: try newer interface if present.
         try:
             from dhanhq import DhanContext, MarketFeed  # type: ignore
+            ctx = DhanContext(client_id, access_token)
+            self._feed = MarketFeed(ctx, self._instruments, version="v2")
+            self._mode = "class"
+            return
         except Exception as e:  # pragma: no cover
-            raise DhanUnavailable("Dhan SDK not installed. Install 'dhanhq'.") from e
-
-        self._DhanContext = DhanContext
-        self._MarketFeed = MarketFeed
-        self._ctx = DhanContext(client_id, access_token)
-        self._instruments = [(i.exchange_segment, i.security_id, i.subscription_type) for i in instruments]
-        self._feed = MarketFeed(self._ctx, self._instruments, version="v2")
+            raise DhanUnavailable(f"Dhan SDK import/init failed. Install/upgrade 'dhanhq'. Root error: {last_err} / {e}") from e
 
     def disconnect(self) -> None:
         try:
