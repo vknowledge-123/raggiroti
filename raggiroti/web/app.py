@@ -98,6 +98,12 @@ LIVE_LAST_TICK_LTP: float | None = None
 LIVE_FEED_CONFIG: dict | None = None
 LIVE_SEED_THREAD: threading.Thread | None = None
 LIVE_SEED_STATUS: dict | None = None
+LIVE_TICK_DEBUG_LOCK = threading.Lock()
+LIVE_TICK_DEBUG: list[dict] = []
+LIVE_TICK_DEBUG_MAX = 200
+LIVE_TICK_DEBUG_LAST_PUSH_AT: float = 0.0
+LIVE_OI_DEBUG_LOCK = threading.Lock()
+LIVE_OI_DEBUG: dict | None = None
 
 SIM_ENGINE: LiveSimEngine | None = None
 
@@ -126,6 +132,31 @@ def _push_live_error(kind: str, detail: object) -> None:
                 LIVE_ERRORS[:] = LIVE_ERRORS[-int(LIVE_ERRORS_MAX) :]
     except Exception:
         pass
+
+
+def _compact_tick_msg(msg: object) -> dict:
+    """
+    Reduce a raw MarketFeed message to a small JSON-friendly dict for debugging.
+    """
+    if not isinstance(msg, dict):
+        return {"type": type(msg).__name__}
+    data = msg.get("Data") if isinstance(msg.get("Data"), dict) else msg
+    if not isinstance(data, dict):
+        data = {}
+    out = {
+        "type": data.get("type"),
+        "exchange_segment": data.get("exchange_segment"),
+        "security_id": data.get("security_id"),
+        "LTP": data.get("LTP"),
+        "volume": data.get("volume"),
+        "OI": data.get("OI"),
+        "oi_day_high": data.get("oi_day_high"),
+        "oi_day_low": data.get("oi_day_low"),
+        "prev_close": data.get("prev_close"),
+        "prev_OI": data.get("prev_OI"),
+        "keys": list(data.keys())[:25],
+    }
+    return out
 
 
 def _extract_list_any(obj: object, keys: list[str]) -> list[str]:
@@ -633,6 +664,8 @@ def home() -> str:
       <form id="livef" method="post" action="/api/live/start" onsubmit="event.preventDefault(); liveStart();">
         <label>Symbol</label>
         <input name="symbol" value="NIFTY" />
+        <label>Feed mode (auto|ticker|quote|full)</label>
+        <input name="feed_mode" value="auto" />
         <label>Quantity</label>
         <input name="qty" type="number" value="65" />
         <label>Seed previous trading day (Dhan)</label>
@@ -648,6 +681,7 @@ def home() -> str:
           <button type="button" onclick="liveFills()">Fills</button>
           <button type="button" onclick="liveOI()">OI</button>
           <button type="button" onclick="liveErrors()">Errors</button>
+          <button type="button" onclick="liveDebugTicks()">Debug Ticks</button>
         </div>
         <p class="muted">Connects to Dhan MarketFeed websocket and builds 1-minute OHLC. No real orders are placed.</p>
       </form>
@@ -846,6 +880,11 @@ def home() -> str:
       }
       async function liveOI() {
         const r = await fetch('/api/live/oi');
+        const j = await r.json();
+        document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
+      }
+      async function liveDebugTicks() {
+        const r = await fetch('/api/live/debug/ticks?limit=40');
         const j = await r.json();
         document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
       }
@@ -1161,6 +1200,7 @@ def _start_live_thread(
     qty: int,
     prev_day_candles: list | None,
     prev_day_date: str | None,
+    feed_mode: str = "auto",  # auto|ticker|quote|full
 ) -> None:
     global LIVE_THREAD, LIVE_OI_THREAD, LIVE_ENGINE, LIVE_CANDLE_BUILDER, LIVE_FEED
     assert LIVE_LOOP is not None, "server loop not ready"
@@ -1213,22 +1253,41 @@ def _start_live_thread(
             # Indices (NIFTY/BANKNIFTY) are on the IDX exchange segment in Dhan MarketFeed.
             # Using NSE here will subscribe to an equity with the same security_id and produce wrong prices.
             sym0 = (symbol or "").upper().strip()
+            mode = (feed_mode or "auto").strip().lower()
             if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"}:
                 exch = marketfeed.IDX
-                # For indices, TICKER is the most reliable/fast stream (LTP only).
-                # We can still build 1m OHLC candles from LTP ticks.
-                sub_type = marketfeed.Ticker
+                # For index stream:
+                # - ticker = LTP only (no volume)
+                # - quote/full may include volume/ohlc (depends on Dhan backend)
+                if mode == "full":
+                    sub_type = marketfeed.Full
+                elif mode == "quote":
+                    sub_type = marketfeed.Quote
+                elif mode == "ticker":
+                    sub_type = marketfeed.Ticker
+                else:
+                    # default for index: ticker (most reliable)
+                    sub_type = marketfeed.Ticker
             else:
                 exch = marketfeed.NSE
-                sub_type = marketfeed.Full
+                if mode == "ticker":
+                    sub_type = marketfeed.Ticker
+                elif mode == "quote":
+                    sub_type = marketfeed.Quote
+                else:
+                    sub_type = marketfeed.Full
         except Exception:
             # Fallback defaults (may be wrong for some segments).
             sym0 = (symbol or "").upper().strip()
             exch = 0 if sym0 in {"NIFTY", "BANKNIFTY", "BANK_NIFTY"} else 1
-            sub_type = 15 if exch == 0 else 21
+            mode = (feed_mode or "auto").strip().lower()
+            if exch == 0:
+                sub_type = 21 if mode == "full" else (17 if mode == "quote" else 15)
+            else:
+                sub_type = 21 if mode in {"auto", "full"} else (17 if mode == "quote" else 15)
         try:
             global LIVE_FEED_CONFIG
-            LIVE_FEED_CONFIG = {"exchange_segment": int(exch), "subscription_type": int(sub_type)}
+            LIVE_FEED_CONFIG = {"exchange_segment": int(exch), "subscription_type": int(sub_type), "feed_mode": (feed_mode or "auto")}
         except Exception:
             pass
 
@@ -1245,6 +1304,21 @@ def _start_live_thread(
             def on_tick(msg: dict) -> None:
                 if LIVE_STOP.is_set():
                     raise SystemExit()
+
+                # Debug capture (rate-limited): store raw-ish snapshots so user can inspect the exact Dhan format.
+                try:
+                    global LIVE_TICK_DEBUG_LAST_PUSH_AT
+                    now = time.time()
+                    if (now - float(LIVE_TICK_DEBUG_LAST_PUSH_AT)) >= 5.0:
+                        LIVE_TICK_DEBUG_LAST_PUSH_AT = now
+                        item = {"dt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "msg": _compact_tick_msg(msg)}
+                        with LIVE_TICK_DEBUG_LOCK:
+                            LIVE_TICK_DEBUG.append(item)
+                            if len(LIVE_TICK_DEBUG) > int(LIVE_TICK_DEBUG_MAX):
+                                LIVE_TICK_DEBUG[:] = LIVE_TICK_DEBUG[-int(LIVE_TICK_DEBUG_MAX) :]
+                except Exception:
+                    pass
+
                 try:
                     sec, ltp, vol, dt = parse_marketfeed_tick(msg)
                 except ValueError as e:
@@ -1380,7 +1454,12 @@ def _start_live_thread(
 
 
 @app.post("/api/live/start")
-def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int = Form(1)) -> JSONResponse:
+def live_start(
+    symbol: str = Form(...),
+    qty: int = Form(65),
+    seed_prev_day: int = Form(1),
+    feed_mode: str = Form("auto"),
+) -> JSONResponse:
     """
     Starts live paper-trading loop:
     - Dhan MarketFeed websocket -> ticks
@@ -1450,6 +1529,7 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
             qty=int(qty),
             prev_day_candles=None,
             prev_day_date=None,
+            feed_mode=feed_mode,
         )
         if int(seed_prev_day) == 1:
             # Seed previous-day candles asynchronously so /api/live/start responds immediately.
@@ -1489,6 +1569,7 @@ def live_start(symbol: str = Form(...), qty: int = Form(65), seed_prev_day: int 
             "seed": LIVE_SEED_STATUS,
             "thread_alive": alive,
             "last_error": LIVE_LAST_ERROR,
+            "feed_config": LIVE_FEED_CONFIG,
         }
     )
 
@@ -1597,6 +1678,14 @@ def live_errors(limit: int = 100) -> JSONResponse:
     with LIVE_ERRORS_LOCK:
         items = list(LIVE_ERRORS[-lim:])
     return JSONResponse({"ok": True, "count": len(items), "errors": items})
+
+
+@app.get("/api/live/debug/ticks")
+def live_debug_ticks(limit: int = 50) -> JSONResponse:
+    lim = max(1, min(int(limit), 200))
+    with LIVE_TICK_DEBUG_LOCK:
+        items = list(LIVE_TICK_DEBUG[-lim:])
+    return JSONResponse({"ok": True, "count": len(items), "ticks": items})
 
 
 @app.get("/api/live/candles")
