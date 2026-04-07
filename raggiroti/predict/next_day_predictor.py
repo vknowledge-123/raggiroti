@@ -27,10 +27,62 @@ def _extract_json(text: str) -> dict:
     text = (text or "").strip()
     if not text:
         raise ValueError("empty response")
+    # 1) direct parse
     try:
         return json.loads(text)
     except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
+        pass
+
+    # 2) try to extract the first balanced JSON object substring
+    def _balanced_object(s: str) -> str | None:
+        i = s.find("{")
+        if i < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, len(s)):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[i : j + 1]
+        return None
+
+    cand = _balanced_object(text)
+    if cand:
+        try:
+            return json.loads(cand)
+        except Exception:
+            text = cand
+
+    # 3) heuristic repairs for common Gemini "almost JSON" mistakes
+    repaired = text
+    # Quote unquoted keys: {foo: 1} -> {"foo": 1}
+    repaired = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', repaired)
+    # Replace Python-ish tokens
+    repaired = repaired.replace(": None", ": null").replace(": True", ": true").replace(": False", ": false")
+    # Remove trailing commas
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        # 4) last resort: regex object grab
+        m = re.search(r"\{.*\}", repaired, re.DOTALL)
         if not m:
             raise
         return json.loads(m.group(0))
@@ -271,6 +323,22 @@ class NextDayPredictor:
                 prediction=cached,
             )
 
+        bucket_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "bias": {"type": "string", "enum": ["BUY", "SELL", "WAIT"]},
+                "entry_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
+                "operator_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
+                "no_trade_zone": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "null"}]},
+                "sl": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                "targets": {"type": "array", "items": {"type": "number"}},
+                "liquidity_pools": {"type": "array", "items": {"type": "number"}},
+                "reason_points": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["bias", "entry_zone", "operator_zone", "no_trade_zone", "sl", "targets", "liquidity_pools", "reason_points"],
+        }
+
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -292,7 +360,7 @@ class NextDayPredictor:
                 "gap_plans": {
                     "type": "object",
                     "additionalProperties": False,
-                    "properties": {k["key"]: {"type": "object"} for k in gap_buckets},
+                    "properties": {k["key"]: bucket_schema for k in gap_buckets},
                 },
             },
             "required": ["summary_points", "base_levels", "gap_plans"],
@@ -304,7 +372,7 @@ class NextDayPredictor:
             "For each gap bucket, output actionable levels (operator zones, liquidity pools) and a one-sided bias for that bucket. "
             "Be conservative: if unsure for a bucket, set its plan to WAIT and explain briefly. "
             "All strings must be SINGLE-LINE (no raw newlines). If needed, use '\\n' inside strings. "
-            "Output STRICT JSON only. No markdown."
+            "Output STRICT JSON only. No markdown. No comments. No trailing commas. Use double quotes for all JSON keys/strings."
         )
 
         body = {
@@ -319,11 +387,68 @@ class NextDayPredictor:
 
         url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
         params = {"key": self.api_key}
-        data: dict | None = None
+        def _fallback_prediction(err: str) -> dict:
+            pc = float(prev_levels.close)
+            pdh = float(prev_levels.high)
+            pdl = float(prev_levels.low)
+            rng = max(1.0, pdh - pdl)
+            q1 = float(pdl + 0.25 * rng)
+            q3 = float(pdl + 0.75 * rng)
+            base = {
+                "prev_close": pc,
+                "PDH": pdh,
+                "PDL": pdl,
+                "operator_sell_zone": [pdh - 10.0, pdh + 25.0],
+                "operator_buy_zone": [pdl - 25.0, pdl + 10.0],
+                "no_trade_zone": [q1, q3],
+            }
+
+            def _bucket_plan(b: dict) -> dict:
+                typ = b["type"]
+                if typ == "gap_up":
+                    bias = "SELL"
+                    entry_zone = [pdh - 5.0, pdh + 15.0]
+                    sl = pdh + 30.0
+                    targets = [pc, q1, pdl]
+                    pools = [pdh, pc, pdl]
+                else:
+                    bias = "BUY"
+                    entry_zone = [pdl - 15.0, pdl + 5.0]
+                    sl = pdl - 30.0
+                    targets = [pc, q3, pdh]
+                    pools = [pdl, pc, pdh]
+                return {
+                    "bias": bias,
+                    "entry_zone": entry_zone,
+                    "operator_zone": base["operator_sell_zone"] if bias == "SELL" else base["operator_buy_zone"],
+                    "no_trade_zone": base["no_trade_zone"],
+                    "sl": sl,
+                    "targets": targets[:3],
+                    "liquidity_pools": pools[:3],
+                    "reason_points": [
+                        "Fallback plan (Gemini output invalid).",
+                        "Levels anchored to prev_close/PDH/PDL quartiles.",
+                        "Wait for sweep+reclaim at PDH/PDL before commitment.",
+                    ],
+                }
+
+            gap_plans = {b["key"]: _bucket_plan(b) for b in gap_buckets}
+            return {
+                "summary_points": [
+                    "Fallback prediction used due to Gemini JSON error.",
+                    f"Error: {err}",
+                ],
+                "base_levels": base,
+                "gap_plans": gap_plans,
+                "_fallback": True,
+            }
+
+        out: dict | None = None
         last_err: str | None = None
-        with httpx.Client(timeout=self.timeout_s) as client:
-            for attempt in range(1, int(self.max_retries) + 1):
-                try:
+        try:
+            data: dict | None = None
+            with httpx.Client(timeout=self.timeout_s) as client:
+                for attempt in range(1, int(self.max_retries) + 1):
                     r = client.post(url, params=params, json=body)
                     if r.status_code >= 400 and "responseSchema" in body["generationConfig"]:
                         body["generationConfig"].pop("responseSchema", None)
@@ -333,27 +458,20 @@ class NextDayPredictor:
                     except httpx.HTTPStatusError as e:
                         status = getattr(getattr(e, "response", None), "status_code", None)
                         if status in (429, 500, 502, 503, 504) and attempt < int(self.max_retries):
-                            last_err = _sanitize_error(str(e))
                             time.sleep(float(self.retry_backoff_s) * (2 ** (attempt - 1)))
                             continue
                         raise
                     data = r.json()
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = _sanitize_error(str(e))
                     break
 
-        if data is None:
-            store.close()
-            raise RuntimeError(f"gemini_error: {last_err or 'unknown_error'}")
+            if data is None:
+                raise RuntimeError("gemini_error: empty response")
 
-        # Parse response
-        try:
             text = _extract_candidate_text(data)
             out = _extract_json(text)
         except Exception as e:
-            # One parse retry: ask again with no schema and tighter token limit.
+            last_err = _sanitize_error(str(e))
+            # One parse retry: no schema.
             try:
                 body2 = {
                     "contents": body["contents"],
@@ -369,11 +487,10 @@ class NextDayPredictor:
                     data2 = r2.json()
                 text2 = _extract_candidate_text(data2)
                 out = _extract_json(text2)
+                last_err = None
             except Exception as e2:
-                store.close()
-                raise RuntimeError(
-                    f"gemini_parse_error: {_sanitize_error(str(e))} / retry_failed: {_sanitize_error(str(e2))}"
-                ) from e2
+                last_err = f"{last_err} / retry_failed: {_sanitize_error(str(e2))}"
+                out = _fallback_prediction(last_err)
 
         cache_id = f"pred_{req_hash[:16]}"
         store.set_llm_cache(cache_id, datetime.now(timezone.utc).isoformat(), self.model, req_hash, out)
