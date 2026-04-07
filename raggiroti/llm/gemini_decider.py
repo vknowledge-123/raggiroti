@@ -35,6 +35,19 @@ def _sanitize_error(s: str) -> str:
     return s
 
 
+def _normalize_model_id(model: str) -> str:
+    """
+    Accept both forms:
+      - "gemini-2.0-flash-001"
+      - "models/gemini-2.0-flash-001"
+    because ListModels returns names prefixed with "models/".
+    """
+    m = (model or "").strip()
+    if m.startswith("models/"):
+        m = m[len("models/") :]
+    return m
+
+
 @dataclass(frozen=True)
 class GeminiDecider:
     """
@@ -98,6 +111,8 @@ class GeminiDecider:
         }
 
         url = f"{self.base_url}/models/{self.model}:generateContent"
+        # Normalize model id to avoid "/models/models/..." 404s when users copy from ListModels.
+        url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
         params = {"key": self.api_key}
         try:
             with httpx.Client(timeout=self.timeout_s) as client:

@@ -455,9 +455,9 @@ def home() -> str:
         <label>Gemini API Key</label>
         <input name="api_key" placeholder="AIza..." required />
         <label>Decision model (per 1m candle)</label>
-        <input name="decision_model" value="gemini-2.0-flash" />
+        <input name="decision_model" value="gemini-2.5-flash" />
         <label>Extraction model (transcript → rules)</label>
-        <input name="extract_model" value="gemini-2.0-pro" />
+        <input name="extract_model" value="gemini-2.5-pro" />
         <div style="margin-top:12px;">
           <button type="submit">Save</button>
         </div>

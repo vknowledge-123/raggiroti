@@ -17,7 +17,13 @@ def _extract_json(text: str) -> dict:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
             raise
-        return json.loads(m.group(0))
+    return json.loads(m.group(0))
+
+def _normalize_model_id(model: str) -> str:
+    m = (model or "").strip()
+    if m.startswith("models/"):
+        m = m[len("models/") :]
+    return m
 
 
 @dataclass(frozen=True)
@@ -89,7 +95,7 @@ class GeminiRuleExtractor:
             },
         }
 
-        url = f"{self.base_url}/models/{self.model}:generateContent"
+        url = f"{self.base_url}/models/{_normalize_model_id(self.model)}:generateContent"
         params = {"key": self.api_key}
 
         with httpx.Client(timeout=self.timeout_s) as client:
@@ -108,4 +114,3 @@ class GeminiRuleExtractor:
             .get("text", "")
         )
         return _extract_json(text)
-
