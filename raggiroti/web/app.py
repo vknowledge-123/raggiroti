@@ -85,6 +85,8 @@ LIVE_ENGINE: LiveSimEngine | None = None
 LIVE_CANDLE_BUILDER: CandleBuilder1m | None = None
 LIVE_LOOP: asyncio.AbstractEventLoop | None = None
 LIVE_OI_SNAPSHOT: dict | None = None
+LIVE_OI_UPDATED_AT: str | None = None
+LIVE_OI_LAST_ERROR: str | None = None
 LIVE_LAST_ERROR: str | None = None
 LIVE_ERRORS_LOCK = threading.Lock()
 LIVE_ERRORS: list[dict] = []
@@ -583,6 +585,8 @@ def home() -> str:
           <button type="button" onclick="liveCandles()">Candles</button>
           <button type="button" onclick="liveDecisions()">Decisions</button>
           <button type="button" onclick="liveFills()">Fills</button>
+          <button type="button" onclick="liveOI()">OI</button>
+          <button type="button" onclick="liveErrors()">Errors</button>
         </div>
         <p class="muted">Connects to Dhan MarketFeed websocket and builds 1-minute OHLC. No real orders are placed.</p>
       </form>
@@ -771,6 +775,16 @@ def home() -> str:
       }
       async function liveFills() {
         const r = await fetch('/api/live/fills');
+        const j = await r.json();
+        document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
+      }
+      async function liveErrors() {
+        const r = await fetch('/api/live/errors?limit=80');
+        const j = await r.json();
+        document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
+      }
+      async function liveOI() {
+        const r = await fetch('/api/live/oi');
         const j = await r.json();
         document.getElementById('liveout').textContent = JSON.stringify(j, null, 2);
       }
@@ -1101,6 +1115,10 @@ def _start_live_thread(
     global LIVE_LAST_TICK_LTP
     LIVE_LAST_TICK_LTP = None
     LIVE_FEED_CONFIG = None
+    global LIVE_OI_SNAPSHOT, LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
+    LIVE_OI_SNAPSHOT = None
+    LIVE_OI_UPDATED_AT = None
+    LIVE_OI_LAST_ERROR = None
     with LIVE_LOCK:
         LIVE_FEED = None
     LIVE_ENGINE = LiveSimEngine(symbol=symbol, security_id=security_id, gemini_api_key=gemini_key, gemini_model=gemini_model, qty=qty)
@@ -1230,6 +1248,7 @@ def _start_live_thread(
 
     # Optional: OI polling (option chain). Runs independently of tick feed.
     def _run_oi() -> None:
+        global LIVE_OI_SNAPSHOT, LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
         try:
             oc = DhanOptionChainClient(client_id=client_id, access_token=access_token)
             # For index: under_exchange_segment is typically IDX_I in REST APIs.
@@ -1239,19 +1258,29 @@ def _start_live_thread(
             if isinstance(exp_list, list) and exp_list:
                 expiry = str(exp_list[0])
             else:
+                _push_live_error("oi_error", {"where": "expiry_list", "error": "empty_expiry_list"})
                 return
         except Exception:
+            _push_live_error("oi_error", {"where": "expiry_list", "error": "exception"})
             return
         while not LIVE_STOP.is_set():
             try:
                 chain = oc.option_chain(under_security_id=int(security_id), under_exchange_segment=ex_seg, expiry=expiry)
                 summary = summarize_oi_walls(chain, top_n=5)
                 if summary.get("ok"):
-                    global LIVE_OI_SNAPSHOT
                     LIVE_OI_SNAPSHOT = summary
+                    LIVE_OI_UPDATED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    LIVE_OI_LAST_ERROR = None
                     if LIVE_ENGINE is not None:
                         LIVE_ENGINE.set_oi_snapshot(summary)
+                else:
+                    LIVE_OI_LAST_ERROR = str(summary.get("error") or "oi_summary_failed")
             except Exception:
+                try:
+                    LIVE_OI_LAST_ERROR = "oi_option_chain_exception"
+                    _push_live_error("oi_error", {"where": "option_chain", "error": LIVE_OI_LAST_ERROR})
+                except Exception:
+                    pass
                 pass
             time.sleep(30)
 
@@ -1368,6 +1397,10 @@ def live_stop() -> JSONResponse:
         global LIVE_LAST_TICK_LTP
         LIVE_LAST_TICK_LTP = None
         LIVE_FEED_CONFIG = None
+        global LIVE_OI_SNAPSHOT, LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
+        LIVE_OI_SNAPSHOT = None
+        LIVE_OI_UPDATED_AT = None
+        LIVE_OI_LAST_ERROR = None
     except Exception:
         pass
     try:
@@ -1557,9 +1590,17 @@ def live_update_oi(payload: dict = Body(...)) -> JSONResponse:
     """
     global LIVE_OI_SNAPSHOT
     LIVE_OI_SNAPSHOT = payload
+    global LIVE_OI_UPDATED_AT, LIVE_OI_LAST_ERROR
+    LIVE_OI_UPDATED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    LIVE_OI_LAST_ERROR = None
     if LIVE_ENGINE is not None:
         LIVE_ENGINE.set_oi_snapshot(payload)
     return JSONResponse({"ok": True})
+
+
+@app.get("/api/live/oi")
+def live_get_oi() -> JSONResponse:
+    return JSONResponse({"ok": True, "updated_at": LIVE_OI_UPDATED_AT, "last_error": LIVE_OI_LAST_ERROR, "snapshot": LIVE_OI_SNAPSHOT})
 
 
 # -------------------- Transcript -> Proposal -> Merge pipeline --------------------
