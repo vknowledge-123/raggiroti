@@ -108,6 +108,34 @@ def _sanitize_error(s: str) -> str:
     return s
 
 
+def _httpx_error_message(e: httpx.HTTPStatusError) -> str:
+    """
+    Extract a useful error message from Gemini REST error bodies (when present).
+    Keeps output safe for logs/UI.
+    """
+    try:
+        resp = getattr(e, "response", None)
+        if resp is None:
+            return _sanitize_error(str(e))
+        msg = ""
+        try:
+            j = resp.json()
+            if isinstance(j, dict):
+                err = j.get("error")
+                if isinstance(err, dict) and isinstance(err.get("message"), str):
+                    msg = err.get("message") or ""
+                elif isinstance(j.get("message"), str):
+                    msg = j.get("message") or ""
+        except Exception:
+            msg = ""
+        base = f"HTTP {resp.status_code}"
+        if msg:
+            base = f"{base}: {msg}"
+        return _sanitize_error(base)
+    except Exception:
+        return _sanitize_error(str(e))
+
+
 def _gemini_feedback(data: dict) -> dict:
     """
     Extract useful debugging signals from Gemini responses (safety blocks, finish reason).
@@ -338,7 +366,7 @@ class GeminiDecider:
                     last_err = None
                     break
                 except httpx.HTTPStatusError as e:
-                    last_err = _sanitize_error(str(e))
+                    last_err = _httpx_error_message(e)
                     # For non-transient codes, don't retry.
                     status = getattr(getattr(e, "response", None), "status_code", None)
                     if status not in (429, 500, 502, 503, 504):
